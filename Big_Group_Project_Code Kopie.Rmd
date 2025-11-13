@@ -1,0 +1,131 @@
+---
+title: "Intermediate Deliverable #1 of Group Project#2"
+author: "Group: High 5!"
+date: "2025-10-24"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    theme: lumen
+---
+# Hotel Reservations
+
+Link to our data set from Kaggle: https://www.kaggle.com/datasets/ahsan81/hotel-reservations-classification-dataset?resource=download
+
+***
+
+## Business Case
+
+The hospitality industry faces growing challenges due to rising hotel booking cancellations, which directly affect revenue, occupancy rates, and operational planning. To address this issue, our project focuses on developing a predictive model that determines whether a guest is likely to cancel a reservation based on their booking information.
+
+Our central business question is: **Can we accurately predict the likelihood of a hotel booking being canceled based on guest and reservation data, and how can these predictions support data-driven decisions to reduce cancellations and improve profitability?**
+
+Accurately predicting cancellations would allow hotels to identify high-risk bookings early and take proactive actions such as optimizing overbooking strategies, improving customer communication, and adjusting pricing policies. By integrating such predictive insights into decision-making, hotels can minimize financial losses, improve resource allocation, and ultimately enhance overall profitability and guest satisfaction.
+
+***
+
+## Exploring the Data Set
+
+### Variables
+
+Dependent variable:
+
+- booking_status: Flag indicating if the booking was canceled or not.
+
+Independent variables:
+
+- Booking_ID: unique identifier of each booking
+- no_of_adults: Number of adults
+- no_of_children: Number of Children
+- no_of_weekend_nights: Number of weekend nights (Saturday or Sunday) the guest stayed or booked to stay at the hotel
+- no_of_week_nights: Number of week nights (Monday to Friday) the guest stayed or booked to stay at the hotel
+- type_of_meal_plan: Type of meal plan booked by the customer
+- required_car_parking_space: Does the customer require a car parking space? (0 - No, 1- Yes)
+- room_type_reserved: Type of room reserved by the customer. The values are ciphered (encoded) by INN Hotels
+- lead_time: Number of days between the date of booking and the arrival date
+- arrival_year: Year of arrival date
+- arrival_month: Month of arrival date
+- arrival_date: Date of the month
+- market_segment_type: Market segment designation
+- repeated_guest: Is the customer a repeated guest? (0 - No, 1- Yes)
+- no_of_previous_cancellations: Number of previous bookings that were canceled by the customer prior to the current booking
+- no_of_previous_bookings_not_canceled: Number of previous bookings not canceled by the customer prior to the current booking
+- avg_price_per_room: Average price per day of the reservation; prices of the rooms are dynamic. (in euros)
+- no_of_special_requests: Total number of special requests made by the customer (e.g. high floor, view from the room, etc)
+
+### Load and Clean the Data
+
+```{r}
+library(caret)
+library(skimr)
+
+data <- read.csv("HotelReservations.csv", stringsAsFactors = TRUE)
+data$booking_status <- ifelse(as.character(data$booking_status) == "Canceled", 1, 0)
+data$Booking_ID <- NULL
+str(data)
+```
+```{r}
+hotel <- read.csv("hotel_booking.csv", stringsAsFactors = TRUE)
+skim(hotel)
+```
+```{r}
+str(hotel)
+```
+```{r}
+df <- as.data.frame(cbind(
+  reservation_status = hotel$reservation_status,
+  is_canceled = hotel$is_canceled,
+  time_between_arrival_and_show = hotel$lead_time
+))
+df
+summary(hotel$reservation_status)
+```
+
+***
+
+## Test Practicability
+
+### Build a simple Logistic Regression Model
+
+
+```{r}
+train_ratio <- 0.7
+set.seed(12345)
+train_rows <- sample(1:nrow(data), train_ratio * nrow(data))
+train <- data[train_rows, ]
+test  <- data[-train_rows, ]
+
+
+log_model <- glm(booking_status ~ ., data = train, family = binomial())
+
+
+pred_log <- predict(log_model, test, type = "response")
+
+
+pred_class <- ifelse(pred_log >= 0.5, 1, 0)
+
+```
+### Evaluate the Model
+
+```{r}
+confusionMatrix(as.factor(pred_class), as.factor(test$booking_status), positive = "1")
+```
+
+We see that we can build a logistic regression model with our data. Further, although accuracy is 81%, our basic logistic regression model has low sensitivity (65%). This finding is problematic because low sensitivity means that the model fails to correctly identify many of the bookings that will actually be canceled. In other words, a large number of real cancellations are being predicted as “not canceled.” From a business perspective, this is concerning, since hotels would continue to treat these risky bookings as secure. As a result, they could face unexpected last-minute cancellations, leading to empty rooms, reduced occupancy rates, and lost revenue opportunities.
+
+***
+
+## Next steps
+
+To address the issue previously found, we plan to improve our model’s performance in the coming days and weeks. Our next steps will involve experimenting with different machine learning approaches to increase sensitivity and overall predictive power. We will explore various supervised learning models such as KNN, decision trees (and probably random forest) to compare their effectiveness against our baseline logistic regression.
+
+In addition, we also intend to apply unsupervised learning techniques, particularly clustering, to identify patterns or guest segments that are more likely to cancel their reservations. By combining insights from both supervised and unsupervised approaches, we aim to build a more robust understanding of customer behavior and develop a model that provides more accurate and actionable predictions for hotel management.
+
+In addition to improving our models, we will also start working with GitHub to enhance collaboration within our team. Using GitHub will allow us to share code efficiently, track changes, and manage different versions of our project in an organized way. This will help us work more effectively as a group, avoid overwriting each other’s work, and maintain a clear record of our progress as we continue developing and testing new models.
+
+***
+
+Date: 11/11/2025
+

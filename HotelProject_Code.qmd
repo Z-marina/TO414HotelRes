@@ -1,0 +1,353 @@
+---
+title: "Hotel Booking - Data Cleaning"
+subtitle: "Group: High5!"
+author:
+  - name: Marco Molnar
+  - name: Magnus Nielsen 
+  - name: Kenzo Schmitz
+date: "November 29, 2025"
+format:
+  html:
+    embed-resources: true
+    self-contained: true
+    self-contained-math: true
+    toc: true
+    toc-location: left
+    toc-depth: 6
+    theme: cosmo
+    code-fold: true
+    code-tools: true 
+highlight-style: dracula
+---
+
+# Step 1 & 2: Load and Clean the Data
+
+```{r}
+library(dplyr)
+library(skimr)
+library(forcats)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(C50)
+library(neuralnet)
+library(class)
+library(randomForest)
+library(kernlab)
+```
+
+```{r}
+data <- read.csv("hotel_booking.csv")
+skim(data)
+```
+
+### Artificial Variables
+
+The variables `name`, `email`, `phone-number` and `credit-card` are not real variables because they were imputed to protect personel data. For this reason, we will not consider these artificial variables as features, because we don't know ecactly how the imputation worked. It is only stated that these variables **... have been artificially created using a python and filled into the dataset**. 
+
+```{r}
+data <- data %>%
+  select(-name, -email, -phone.number,-credit_card)
+str(data)
+
+```
+
+
+### Handle N/As
+
+### Company
+
+We can directly observe that for `agent` and especially for `company` we have a lot of missing values. The completion rate of the latter is just 5.6%. So the naive approach would be to just A) delete all observations where we have a missing value or B) ignore the two independent variables as predictors. But we believe these variables still have some interesting information and therefore we proceed as follows:
+
+To handle the predictor variable company, which contains more than 80% missing values and a large number of rare categories, we grouped the companies into the five most common categories and combined all remaining companies into a single “Other” category. We then created dummy variables for these groups. This approach reduces noise from many low-frequency categories, prevents overfitting, and ensures that the model focuses on the most informative company categories while still retaining a meaningful comparison group.
+
+- We
+-
+
+
+```{r}
+# Count non-NA companies and pick top 5
+top5 <- data %>%
+  filter(!is.na(company)) %>%
+  count(company, name = "n") %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5)
+
+# Create a named *character* vector: company_value → "Company_TopX"
+top5_names <- as.character(top5$company)     # convert to character
+names(top5_names) <- paste0("Company_Top", seq_along(top5_names))
+
+# Recode companies into Company_TopX or Company_Others
+data <- data %>%
+  mutate(
+    company_group = case_when(
+      company %in% top5$company ~ names(top5_names)[match(as.character(company), top5_names)],
+      TRUE ~ "Company_Others"   # includes NA automatically
+    )
+  )
+
+data$company_group <- as.factor(data$company_group)
+summary(data$company_group)
+data <- data %>%
+  select(-company)
+
+
+```
+
+### Agent
+
+```{r}
+# 1. Count non-NA agents and pick top 5
+top5_agent <- data %>%
+  filter(!is.na(agent)) %>%
+  count(agent, name = "n") %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5)
+
+
+# 2. Create a named *character* vector: agent_value -> "Agent_TopX"
+top5_agent_vals <- as.character(top5_agent$agent)
+names(top5_agent_vals) <- paste0("Agent_Top", seq_along(top5_agent_vals))
+
+# 3. Recode agents into Agent_TopX or Agent_Others
+data <- data %>%
+  mutate(
+    agent_group = case_when(
+      as.character(agent) %in% top5_agent_vals ~
+        names(top5_agent_vals)[match(as.character(agent), top5_agent_vals)],
+      TRUE ~ "Agent_Others"   # includes NA automatically
+    ),
+    agent_group = factor(agent_group)
+  ) %>%
+  select(-agent)   # drop original numeric agent variable if you don’t need it anymore
+
+# Quick check
+summary(data$agent_group)
+
+```
+
+### Children
+
+```{r}
+data <- data %>%
+  filter(!is.na(children))
+```
+
+
+### Convert Character to Date
+
+We also notice that `reservation_status_data` is encoded as a character, but it is actually a date. 
+
+```{r}
+data$reservation_status_date <- as.Date(data$reservation_status_date)
+str(data)
+
+```
+
+### Convert Characters to Factors
+
+```{r}
+data <- data %>%
+  mutate(
+    hotel                   = as.factor(hotel),
+    arrival_date_month      = as.factor(arrival_date_month),
+    meal                    = as.factor(meal),
+    country                 = as.factor(country),
+    market_segment          = as.factor(market_segment),
+    distribution_channel    = as.factor(distribution_channel),
+    reserved_room_type      = as.factor(reserved_room_type),
+    assigned_room_type      = as.factor(assigned_room_type),
+    deposit_type            = as.factor(deposit_type),
+    customer_type           = as.factor(customer_type),
+    reservation_status      = as.factor(reservation_status)
+  )
+str(data)
+```
+
+### Data Leakage Problem
+
+As we converted `reservation_status` to factors and have a look at the `str()` report above, we see that we have three differnt levels. Let's have a closer look at the variable `reservation_status`:
+
+```{r}
+summary(data$reservation_status)
+```
+
+We see that this variable contains the information if a customer has cancelled his booking or not. This seems weird because this information should capture **only our dependent variable**. 
+
+```{r}
+data <- data %>%
+  mutate(
+    reservation_status = factor(reservation_status),
+    # Lump "Canceled" + "No-Show" into one level
+    reservation_status_lumped = fct_collapse(
+      reservation_status,
+      "Canceled_or_NoShow" = c("Canceled", "No-Show"),
+      "Check-Out"          = "Check-Out"
+    )
+  )
+data <- data %>%
+  mutate(
+    canceled_from_status = if_else(
+      reservation_status_lumped == "Canceled_or_NoShow",
+      1L,  # canceled
+      0L   # not canceled (e.g., "Check-Out")
+    )
+  )
+data <- data %>%
+  mutate(
+    same_info = (is_canceled == canceled_from_status)
+  )
+
+# Proportion of rows where they agree
+mean(data$same_info)
+
+# Cross-tabulation for more detail
+table(is_canceled = data$is_canceled,
+      status_binary = data$canceled_from_status)
+
+```
+
+To examine whether the two variables `is_canceled` (our dependent variable) and `reservation_status` contain the same underlying information, we first recoded reservation_status into a binary factor called `status_binary`. In this step, the levels "Canceled" and "No-Show" were grouped together as 1, while "Check-Out" was coded as 0. This allowed the two variables to be placed on the same numerical scale (0/1). We then created a cross-tabulation comparing is_canceled with status_binary. The resulting table shows a perfect match: every observation where is_canceled = 1 also has status_binary = 1, and every case where is_canceled = 0 corresponds to status_binary = 0. **This confirms that the factor variable reservation_status is providing the exact same information as is_canceled, meaning reservation_status is redundant and can be removed from further modeling to avoid information leakage**.
+
+```{r}
+data <- data %>%
+  select(-reservation_status, -reservation_status_lumped, -canceled_from_status, -same_info)
+str(data)
+```
+
+### Country
+
+To reduce the dimensionality of the categorical variable country, we grouped countries according to their contribution to the total frequency in the dataset. First, we ranked all countries by how often they appear. We then identified the smallest set of countries whose cumulative frequency accounts for approximately 80% of all observations. These high-frequency countries were kept as individual factor levels, because they contain most of the information. All remaining low-frequency countries—together with any missing values—were pooled into a single category named “Country_Other”. This approach retains the most informative variation in the data while preventing excessive sparsity, improving model stability and interpretability. **Using this approach, we reduced the dimensionality from 178 levels to just 8 levels and still kept the relevant information.**
+
+```{r}
+# Step 1: Count countries and compute cumulative percentage
+country_freq <- data %>%
+  count(country, name = "n") %>%
+  arrange(desc(n)) %>%
+  mutate(
+    pct = n / sum(n),
+    cum_pct = cumsum(pct)
+  )
+
+# Step 2: Select countries contributing to ~80%
+top_countries <- country_freq %>%
+  filter(cum_pct <= 0.80) %>%
+  pull(country)
+
+# Step 3: Recode into Top countries vs Other
+data <- data %>%
+  mutate(
+    country_group = case_when(
+      country %in% top_countries ~ as.character(country),
+      TRUE ~ "Country_Other"
+    ),
+    country_group = as.factor(country_group)
+  )
+
+# Optional: remove original variable
+# data <- data %>% select(-country)
+
+# Check final distribution
+summary(data$country_group)
+data <- data %>% select(-country)
+str(data)
+
+```
+
+### Change Name of Dependent Variable
+
+For simplicity, we change the name of the dependent variable to `y`.
+
+```{r}
+data$y <- data$is_canceled
+data <- data %>%
+  select(-is_canceled)
+```
+
+
+### Final Datasets for Different Algorithms
+
+#### Logistic Regression
+
+::: {.callout-important title="Checklist for Logistic Regression"}
+-   Dependent Variable can be numeric (0/1)
+-   Min-Max scaling **is not** necessary
+-   Dummy Variables **is not** necessary
+:::
+
+```{r}
+data_log <- data
+```
+
+
+#### ANN & KNN
+
+::: {.callout-important title="Checklist for ANN and KNN"}
+-   Neural networks are sensitive to variable ranges.
+-   Dependent Variable can be numeric (0/1)
+-   Min-Max scaling **is** necessary
+-   Dummy Variables **is** necessary
+:::
+
+We first drop the dependent variable, then one-hot encoding all the features to create dummy variables for all categorical variables. In a next step, we use min-max scaling and add back the dependent variable:
+
+```{r}
+data_ann <- data
+
+data_ann_no_y <- data_ann %>% select(-y) # drop the dependent variable
+data_ann <- as.data.frame(model.matrix(~ . -1, data = data_ann_no_y))
+
+# scale variables to ensure each variable has minimal value of 0 and maximum value of 1
+minmax <- function(x){
+  (x-min(x))/(max(x)-min(x))
+}
+
+data_ann <- as.data.frame(lapply(data_ann, minmax))
+data_ann$y <- data$y
+data_knn <- data_ann
+str(data_ann)
+```
+
+#### Supported Vector Machines
+
+::: {.callout-important title="Checklist for SVM"}
+-   Dependent Variable **must be a two level factor**
+-   Min-Max scaling **is** necessary
+-   Dummy Variables **is** necessary
+:::
+
+SVM requires the same type of preprocessed feature data as ANN and KNN — fully numeric, dummy-coded for nominal variables, and standardised — because all three methods depend on distance or gradient-based optimisation. The only difference is that SVM needs the dependent variable to be a binary factor, whereas ANN and KNN use a numeric 0/1 target.
+
+```{r}
+data_svm <- data_ann
+
+# Dependent variable as factor
+data_svm$y <- as.factor(data_svm$y)
+```
+
+#### Decision Trees & Random Forest
+
+::: {.callout-important title="Checklist for Decision Trees & Random Forest"}
+-   Dependent Variable **should be a two level factor**
+-   Min-Max scaling **is not** necessary
+-   Dummy Variables **is not** necessary
+:::
+
+```{r}
+data_dt <- data
+
+data_dt$y <- as.factor(data_dt$y)
+data_rf <- data_dt
+```
+
+### Export Cleaned Datasets
+
+```{r}
+write.csv(data_log,"data_log.csv")
+write.csv(data_ann,"data_ann.csv")
+write.csv(data_knn,"data_knn.csv")
+write.csv(data_dt,"data_dt.csv")
+write.csv(data_rf,"data_rf.csv")
+```
+
+

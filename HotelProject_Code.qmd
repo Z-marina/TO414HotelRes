@@ -26,6 +26,8 @@ highlight-style: dracula
 
 ```{r}
 library(dplyr)
+library(rpart)
+library(rpart.plot)
 library(tidyr)
 library(skimr)
 library(forcats)
@@ -224,7 +226,7 @@ We can directly observe that for `agent` and especially for `company` we have a 
 
 To handle the predictor variable `company`, which contains more than 80% missing values and a large number of rare categories, we grouped the companies into the five most common categories and combined all remaining companies into a single “Other” category. We then created dummy variables for these groups. This approach reduces noise from many low-frequency categories, prevents overfitting, and ensures that the model focuses on the most informative company categories while still retaining a meaningful comparison group.
 
-- We
+- We **add somthing here**?? 
 -
 
 
@@ -258,6 +260,7 @@ data <- data %>%
 ```
 
 ### Agent
+- We follow the same logic we used for `company`, but now for `agent`
 
 ```{r}
 # 1. Count non-NA agents and pick top 5
@@ -307,6 +310,7 @@ data$reservation_status_date <- as.Date(data$reservation_status_date)
 
 ### Only one level factor for Room Type and Distribution Channel
 
+** random blank space? **
  
 
 
@@ -339,7 +343,7 @@ data <- subset(data, distribution_channel != "Undefined")
 
 ### Data Leakage Problem
 
-As we converted `reservation_status` to factors and have a look at the `str()` report above, we see that we have three differnt levels. Let's have a closer look at the variable `reservation_status`:
+As we converted `reservation_status` to factors and have a look at the `str()` report above, we see that we have three different levels. Let's have a closer look at the variable `reservation_status`:
 
 ```{r}
 summary(data$reservation_status)
@@ -621,7 +625,7 @@ lr_prob_base <- predict(
 
 ```
 
-Now we can create a confusion matrix, using a standard threshold of 0.5
+Now we can create a confusion matrix, using a standard threshold of 0.5 - 
 ```{r}
 # Confusion Matrix
 lr_pred_base <- ifelse(lr_prob_base >= 0.99999999, 1, 0)
@@ -719,7 +723,6 @@ ggplot() +
 
 ```
 
-
 Interpretation: The logistic regression model performs extremely well on the test set, with 99.72% accuracy, sensitivity of 0.995, and specificity of 0.998. This means the model correctly identifies both cancellations and non-cancellations with very few mistakes, which is important for reducing costly overbooking errors. The expected profit per booking is approximately 50.46 under our defined cost structure, showing that the model remains effective even when accounting for the asymmetric cost of false negatives. Logistic regression also highlights key predictors—lead time, deposit type, and market segment—making it a strong and interpretable baseline for understanding cancellation behavior.
 
 ```{r}
@@ -783,7 +786,7 @@ ggplot() +
   )
 
 ```
-
+** duplicate?  **
 
 ```{r}
 lr_model_base <- glm(y ~ ., data = train_first_log, family = binomial)
@@ -800,6 +803,7 @@ for (A in c("base", "step")) {
     assign(paste0("lr_pred_", A), ifelse(get(paste0("lr_prob_", A)) >= t, "1", "0"))
     assign(paste0("lr_cm_", A), confusionMatrix(as.factor(get(paste0("lr_pred_", A))), as.factor(test_first_log$y), positive = "1"))
     cm <- confusionMatrix(as.factor(get(paste0("lr_pred_", A))), as.factor(test_first_log$y), positive = "1")
+    print(cm)
     assign(paste0("lr_gain_", A), gain_function(cm))
     assign(paste0("lr_kappa_", A), as.numeric(cm$overall["Kappa"]))
     assign(paste0("lr_accuracy_", A), as.numeric(cm$overall["Accuracy"]))
@@ -1159,6 +1163,7 @@ ggplot() +
 
 
 ```
+Interpretation: Across all three KNN specifications, the method performs consistently worse than logistic regression and struggles to model cancellation behavior in a way that would be useful for hotel decision making. The basic KNN model reaches an accuracy of 77.9 percent and a Kappa value of 0.515, indicating only moderate agreement with the true labels. Its sensitivity is just 0.651, meaning it fails to detect about one third of actual cancellations, and this weakness contributes to a low profit of roughly 20.08, which is less than half of what logistic regression delivers. Tuning KNN for maximum Kappa improves sensitivity to 0.722, but specificity falls to 0.818, increasing the number of false positives, which are the most expensive errors for the hotel. This leads to an even lower profit of 17.63 despite the slightly better classification balance. When KNN is tuned for maximum profit, the model increases specificity to 0.906, which reduces overbooking costs, but does so by sacrificing sensitivity, which drops to 0.545. This means it misses more than half of all true cancellations, creating significant opportunity cost. Profit increases to 23.50, making this the best performing KNN variant, but it still falls far short of logistic regression, which achieves both higher predictive accuracy and substantially higher economic value per booking. Taken together, all KNN variants show clear weaknesses relative to logistic regression, either by missing too many cancellations, generating costly false positives, or failing to produce meaningful profit gains.
 
 ### ANN
 
@@ -1480,4 +1485,499 @@ ggplot() +
   )
 
 ```
+Interpretation: Across the three SVM variants, performance varies meaningfully depending on the kernel choice. The RBF kernel performs reasonably well, with 85.6% accuracy and strong specificity of 0.974, meaning it is very good at identifying guests who will actually show up. However, its sensitivity is lower at 0.655, so it misses a substantial share of true cancellations. This cautious behavior reduces costly false positives but also limits its financial performance, producing a profit of about 36.13 per booking.
+
+In contrast, the polynomial and linear kernel SVM models perform exceptionally well across every metric. Both achieve around 99% accuracy and Kappa values near 0.98, indicating almost perfect alignment with the true outcomes. Sensitivity and specificity are equally strong for both kernels, showing that they identify cancellations and non-cancellations with near-complete accuracy. Financially, they deliver profits of 49.69 and 49.66, essentially matching logistic regression and far outperforming KNN and the RBF SVM.
+
+Taken together, these results show that the cancellation problem is highly separable using linear and polynomial decision boundaries, while the RBF kernel underfits the structure of the data. The polynomial and linear SVM models stand out as top performers, combining excellent predictive accuracy with strong financial outcomes, making them some of the most reliable and effective models for supporting hotel overbooking decisions.
+
+### Random Forrest
+```{r}
+#### Basic Random Forest
+
+set.seed(12345)
+
+rf_model_base <- randomForest(
+y ~ .,
+data   = train_first_rf,
+ntree  = 500,
+mtry   = floor(sqrt(ncol(train_first_rf) - 1)),
+importance = TRUE
+)
+
+rf_model_base
+
+```
+
+```{r}
+## Predictions on the test set for the base Random Forest
+
+rf_pred_base <- predict(
+rf_model_base,
+newdata = test_first_rf,
+type    = "class"
+)
+
+rf_cm_base <- confusionMatrix(
+as.factor(rf_pred_base),
+as.factor(test_first_rf$y),
+positive = "1"
+)
+
+rf_cm_base
+
+```
+
+
+```{r}
+## Profit per booking for the base Random Forest
+
+rf_profit_base <- gain_function(rf_cm_base) /
+sum(rf_cm_base$table)
+
+rf_profit_base
+
+```
+
+```{r}
+## Add base Random Forest to the summary_table and redraw the heatmap
+
+rf_baseline_row <- data.frame(
+model       = "Random Forest base",
+accuracy    = rf_cm_base$overall["Accuracy"],
+kappa       = rf_cm_base$overall["Kappa"],
+sensitivity = rf_cm_base$byClass["Sensitivity"],
+specificity = rf_cm_base$byClass["Specificity"],
+profit      = rf_profit_base
+)
+
+summary_table <- rbind(summary_table, rf_baseline_row)
+
+summary_long <- summary_table %>%
+pivot_longer(
+cols      = -model,
+names_to  = "metric",
+values_to = "value"
+) %>%
+mutate(
+metric = factor(
+metric,
+levels = c("accuracy", "kappa",
+"sensitivity", "specificity",
+"profit")
+),
+model  = factor(model, levels = rev(unique(model)))
+)
+
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+ggplot() +
+geom_tile(
+data  = df_metrics,
+aes(x = metric, y = model, fill = value),
+colour = "white"
+) +
+geom_text(
+data  = df_metrics,
+aes(x = metric, y = model, label = round(value, 3)),
+color = "black",
+size  = 4
+) +
+scale_fill_gradient(
+name = "Performance",
+low  = "#D8E6F3",
+high = "#084594"
+) +
+ggnewscale::new_scale_fill() +
+geom_tile(
+data  = df_profit,
+aes(x = metric, y = model, fill = value),
+colour = "white"
+) +
+geom_text(
+data  = df_profit,
+aes(x = metric, y = model, label = round(value, 3)),
+color = "black",
+size  = 4
+) +
+scale_fill_gradient(
+name = "Profit",
+low  = "#e5f5e0",
+high = "#238b45"
+) +
+labs(
+title = "Model Performance Comparison",
+x     = "Metric",
+y     = "Model"
+) +
+theme_minimal(base_size = 14) +
+theme(
+axis.text.x = element_text(angle = 45, hjust = 1)
+)
+
+```
+
+```{r}
+#### Tuned Random Forest
+
+set.seed(12345)
+
+rf_results <- results   # reuse the empty template you defined earlier
+
+## Choose a grid of mtry values to test
+
+p <- ncol(train_first_rf) - 1   # number of predictors
+mtry_grid <- unique(round(c(sqrt(p), p / 4, p / 2)))
+mtry_grid <- mtry_grid[mtry_grid >= 1]
+
+for (m in mtry_grid) {
+rf_tmp <- randomForest(
+y ~ .,
+data   = train_first_rf,
+ntree  = 500,
+mtry   = m
+)
+
+rf_pred_tmp <- predict(
+rf_tmp,
+newdata = test_first_rf,
+type    = "class"
+)
+
+cm <- confusionMatrix(
+as.factor(rf_pred_tmp),
+as.factor(test_first_rf$y),
+positive = "1"
+)
+
+rf_gain_tmp        <- gain_function(cm)
+rf_kappa_tmp       <- as.numeric(cm$overall["Kappa"])
+rf_accuracy_tmp    <- as.numeric(cm$overall["Accuracy"])
+rf_sensitivity_tmp <- as.numeric(cm$byClass["Sensitivity"])
+rf_specificity_tmp <- as.numeric(cm$byClass["Specificity"])
+
+rf_results <- rbind(
+rf_results,
+data.frame(
+model       = "rf",
+threshold   = m,      # here threshold stores mtry
+kappa       = rf_kappa_tmp,
+gain        = rf_gain_tmp,
+accuracy    = rf_accuracy_tmp,
+sensitivity = rf_sensitivity_tmp,
+specificity = rf_specificity_tmp,
+stringsAsFactors = FALSE,
+row.names       = NULL
+)
+)
+}
+
+rf_maxgain_results <- rf_results[which.max(rf_results$gain), ]
+rf_maxkappa_results <- rf_results[which.max(rf_results$kappa), ]
+
+rf_maxgain_results
+rf_maxkappa_results
+
+```
+
+
+```{r}
+## Best Random Forest by Kappa
+
+best_mtry_kappa <- rf_maxkappa_results$threshold
+
+set.seed(12345)
+rf_best_kappa <- randomForest(
+y ~ .,
+data   = train_first_rf,
+ntree  = 500,
+mtry   = best_mtry_kappa
+)
+
+rf_pred_best_kappa <- predict(
+rf_best_kappa,
+newdata = test_first_rf,
+type    = "class"
+)
+
+cm_rf_best_kappa <- confusionMatrix(
+as.factor(rf_pred_best_kappa),
+as.factor(test_first_rf$y),
+positive = "1"
+)
+
+cm_rf_best_kappa
+
+rf_profit_best_kappa <- gain_function(cm_rf_best_kappa) /
+sum(cm_rf_best_kappa$table)
+
+rf_row_best_kappa <- data.frame(
+model       = "Random Forest best mtry for kappa",
+accuracy    = cm_rf_best_kappa$overall["Accuracy"],
+kappa       = cm_rf_best_kappa$overall["Kappa"],
+sensitivity = cm_rf_best_kappa$byClass["Sensitivity"],
+specificity = cm_rf_best_kappa$byClass["Specificity"],
+profit      = rf_profit_best_kappa
+)
+
+summary_table <- rbind(summary_table, rf_row_best_kappa)
+
+```
+
+```{r}
+## Best Random Forest by profit
+
+best_mtry_profit <- rf_maxgain_results$threshold
+
+set.seed(12345)
+rf_best_profit <- randomForest(
+y ~ .,
+data   = train_first_rf,
+ntree  = 500,
+mtry   = best_mtry_profit
+)
+
+rf_pred_best_profit <- predict(
+rf_best_profit,
+newdata = test_first_rf,
+type    = "class"
+)
+
+cm_rf_best_profit <- confusionMatrix(
+as.factor(rf_pred_best_profit),
+as.factor(test_first_rf$y),
+positive = "1"
+)
+
+cm_rf_best_profit
+
+rf_profit_best_profit <- gain_function(cm_rf_best_profit) /
+sum(cm_rf_best_profit$table)
+
+rf_row_best_profit <- data.frame(
+model       = "Random Forest best mtry for profit",
+accuracy    = cm_rf_best_profit$overall["Accuracy"],
+kappa       = cm_rf_best_profit$overall["Kappa"],
+sensitivity = cm_rf_best_profit$byClass["Sensitivity"],
+specificity = cm_rf_best_profit$byClass["Specificity"],
+profit      = rf_profit_best_profit
+)
+
+summary_table <- rbind(summary_table, rf_row_best_profit)
+
+```
+
+```{r}
+summary_long <- summary_table %>%
+pivot_longer(
+cols      = -model,
+names_to  = "metric",
+values_to = "value"
+) %>%
+mutate(
+metric = factor(
+metric,
+levels = c("accuracy", "kappa",
+"sensitivity", "specificity",
+"profit")
+),
+model  = factor(model, levels = rev(unique(model)))
+)
+
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+ggplot() +
+geom_tile(
+data  = df_metrics,
+aes(x = metric, y = model, fill = value),
+colour = "white"
+) +
+geom_text(
+data  = df_metrics,
+aes(x = metric, y = model, label = round(value, 3)),
+color = "black",
+size  = 4
+) +
+scale_fill_gradient(
+name = "Performance",
+low  = "#D8E6F3",
+high = "#084594"
+) +
+ggnewscale::new_scale_fill() +
+geom_tile(
+data  = df_profit,
+aes(x = metric, y = model, fill = value),
+colour = "white"
+) +
+geom_text(
+data  = df_profit,
+aes(x = metric, y = model, label = round(value, 3)),
+color = "black",
+size  = 4
+) +
+scale_fill_gradient(
+name = "Profit",
+low  = "#e5f5e0",
+high = "#238b45"
+) +
+labs(
+title = "Model Performance Comparison",
+x     = "Metric",
+y     = "Model"
+) +
+theme_minimal(base_size = 14) +
+theme(
+axis.text.x = element_text(angle = 45, hjust = 1)
+)
+
+```
+Interpretation: The Random Forest models perform strongly overall, and each version of the model shows competitive predictive accuracy and financial performance. The base Random Forest achieves 93.5% accuracy with solid sensitivity (0.874) and strong specificity (0.971). This means it correctly identifies most cancellations and almost all non-cancellations, making it safer for overbooking decisions than KNN but slightly less precise than the top SVM and logistic models. Its profit of 42.88 per booking reflects this balance: high overall accuracy but occasional costly misclassifications.
+
+Tuning the model by adjusting the mtry parameter improves performance noticeably. Both the best mtry for Kappa and the best mtry for profit converge to nearly identical performance: 95.4% accuracy, Kappa of 0.9, and sensitivity of 0.906. The improvement in sensitivity is especially valuable because correctly identifying cancellations reduces empty-room losses. Specificity also remains extremely high at 0.982, which prevents false positives that would lead to expensive walk situations. These tuned models produce a profit of about 45.46, a meaningful improvement over the baseline Random Forest and substantially better than all KNN variants.
+
+Overall, Random Forest offers a strong balance of predictive power and financial value, especially after tuning. While it does not quite reach the near-perfect performance of logistic regression or the top SVM models, the tuned Random Forest still ranks among the most reliable models for supporting hotel overbooking decisions. Its robustness to noise and ability to capture nonlinear patterns make it a dependable choice in this setting.
+
+### Decision Tree
+
+```{r}
+### Decision Tree (DT)
+
+# Quick sanity check (read only, no modification)
+
+str(train_first_dt$y)
+table(train_first_dt$y)
+
+# Basic decision tree with rpart
+
+dt_model_base <- rpart(
+y ~ .,
+data   = train_first_dt,
+method = "class",
+control = rpart.control(
+cp        = 0.01,   # pruning strength
+minbucket = 50      # minimum obs in terminal node
+)
+)
+
+# Visualize the tree structure
+
+rpart.plot(
+dt_model_base,
+type  = 2,
+extra = 104,
+tweak = 1.2,
+main  = "Decision Tree for Hotel Booking Cancellations"
+)
+
+# Predictions on the test set
+
+dt_pred_base <- predict(
+dt_model_base,
+newdata = test_first_dt,
+type    = "class"
+)
+
+# Confusion matrix for the base tree
+
+dt_conf_base <- confusionMatrix(
+as.factor(dt_pred_base),
+as.factor(test_first_dt$y),
+positive = "1"
+)
+
+dt_conf_base
+
+```
+
+```{r}
+# Add DT row to summary_table
+
+dt_baseline_row <- data.frame(
+model       = "Decision Tree",
+accuracy    = dt_conf_base$overall["Accuracy"],
+kappa       = dt_conf_base$overall["Kappa"],
+sensitivity = dt_conf_base$byClass["Sensitivity"],
+specificity = dt_conf_base$byClass["Specificity"],
+profit      = gain_function(dt_conf_base) / sum(dt_conf_base$table),
+stringsAsFactors = FALSE
+)
+
+summary_table <- rbind(summary_table, dt_baseline_row)
+
+# Long format for plotting
+
+summary_long <- summary_table %>%
+pivot_longer(
+cols      = -model,
+names_to  = "metric",
+values_to = "value"
+) %>%
+mutate(
+metric = factor(
+metric,
+levels = c("accuracy", "kappa",
+"sensitivity", "specificity",
+"profit")
+),
+model  = factor(model, levels = rev(unique(model)))
+)
+
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# Heatmap with separate scales for performance and profit
+
+ggplot() +
+geom_tile(
+data  = df_metrics,
+aes(x = metric, y = model, fill = value),
+colour = "white"
+) +
+geom_text(
+data  = df_metrics,
+aes(x = metric, y = model, label = round(value, 3)),
+color = "black",
+size  = 4
+) +
+scale_fill_gradient(
+name = "Performance",
+low  = "#D8E6F3",
+high = "#084594"
+) +
+ggnewscale::new_scale_fill() +
+geom_tile(
+data  = df_profit,
+aes(x = metric, y = model, fill = value),
+colour = "white"
+) +
+geom_text(
+data  = df_profit,
+aes(x = metric, y = model, label = round(value, 3)),
+color = "black",
+size  = 4
+) +
+scale_fill_gradient(
+name = "Profit",
+low  = "#e5f5e0",
+high = "#238b45"
+) +
+labs(
+title = "Model Performance Comparison",
+x     = "Metric",
+y     = "Model"
+) +
+theme_minimal(base_size = 14) +
+theme(
+axis.text.x = element_text(angle = 45, hjust = 1)
+)
+
+```
+
+Interpretation: The decision tree model performs moderately well overall but clearly trails behind the more advanced models in both predictive accuracy and economic value. It reaches an accuracy of 82.6% with a Kappa of 0.618, indicating weaker agreement with the true cancellation labels compared to logistic regression, SVMs, and Random Forests. Sensitivity is 0.706, meaning the model correctly identifies about seventy percent of all cancellations while missing a sizeable portion. Specificity is stronger at 0.897, so it is more reliable at detecting guests who actually show up.
+
+This imbalance has direct financial implications. With an expected profit of about 27.62 per booking, the decision tree performs better than the KNN methods but falls far short of the SVMs, logistic regression, and the tuned Random Forests. The lower sensitivity increases false negatives, leading to more unsold rooms, while occasional false positives remain costly due to walk penalties.
+
+Overall, while the decision tree provides a simple and interpretable model, its reduced predictive precision makes it less effective for decisions involving asymmetric costs like hotel overbooking. It may be useful for understanding broad patterns in the data, but it is not competitive with the other models when financial performance is the priority.
 

@@ -46,9 +46,9 @@ library(ggnewscale)
 
 ### Purpose of the Project: Why are We doing this Project?
 
-The goal of this project is to develop a predictive model that estimates the probability that a newly received hotel reservation will be cancelled or not honored by the guest. Cancellations and no-shows represent a major source of uncertainty for hotels, as they directly affect occupancy, revenue, operational planning, and customer experience. Traditional approaches to handling this uncertainty—such as fixed overbooking quotas—are often based on intuition rather than data-driven insights and can either lead to unused capacity or to costly overbooking situations.
+The goal of this project is to develop a predictive model that **estimates the probability that a newly received hotel reservation will be cancelled or not honored by the guest.** Cancellations and no-shows represent a major source of uncertainty for hotels, as they **directly affect occupancy, revenue, operational planning, and customer experience.** Traditional approaches to handling this uncertainty—such as fixed overbooking quotas—are often based on intuition rather than data-driven insights and can either lead to unused capacity or to costly overbooking situations.
 
-By building a machine learning model that forecasts cancellation likelihood, we aim to support hotels in making more informed decisions about overbooking, capacity planning, and pricing. A more accurate prediction of booking reliability allows hotels to sell the optimal number of rooms, reduce the risk of walking guests to other properties, stabilize revenue, and improve resource allocation in areas such as housekeeping and front-office operations. Ultimately, this enhances both financial performance and service quality.
+By building a **machine learning model that forecasts cancellation likelihood**, we aim to support hotels in making **more informed decisions about overbooking, capacity planning, and pricing**. A more accurate prediction of booking reliability allows hotels to sell the optimal number of rooms, reduce the risk of walking guests to other properties, stabilize revenue, and improve resource allocation in areas such as housekeeping and front-office operations. Ultimately, this enhances both financial performance and service quality.
 
 ### Baseline Scenario
 
@@ -531,6 +531,46 @@ data_rf <- data_dt
 #write.csv(data_rf,"data_rf_small.csv")
 ```
 
+
+## Doing some EDA! 
+
+```{r}
+ggplot(data, aes(x = lead_time, fill = as.factor(y))) +
+  geom_histogram(bins = 40, color = "white") +
+  scale_fill_manual(values = c("#70AD47", "#C00000")) +
+  labs(title = "Lead Time Distribution by Cancellation Status",
+       x = "Lead Time (days)", y = "Count")
+
+```
+
+Interpretation: Reservations with longer lead times show a substantially higher cancellation rate. Short-lead reservations (0–30 days) rarely cancel, but far-future bookings show a clear surge in cancellations. This suggests that guests with more time before arrival are more likely to change plans, making lead_time one of the strongest early predictors of cancellation behavior. Operationally, long-horizon bookings should be weighted more heavily in overbooking decisions.
+
+
+```{r}
+ggplot(data, aes(x = deposit_type, fill = as.factor(y))) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("#70AD47", "#C00000")) +
+  labs(title = "Cancellation Rate by Deposit Type",
+       y = "Proportion")
+```
+
+
+Interpretation: Cancellation behavior varies dramatically by deposit policy. Non-refundable bookings almost never cancel, while refundable and no-deposit bookings show much higher cancellation rates. This validates that cancellation incentives matter: when customers bear financial risk, cancellations collapse. Deposit_type is therefore a high-impact categorical predictor and also a lever hotels can adjust to reduce financial losses.
+
+
+```{r}
+ggplot(data, aes(x = market_segment, fill = as.factor(y))) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("#70AD47", "#C00000")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Cancellation Rate by Market Segment",
+       y = "Proportion")
+
+```
+
+## Booking behavior differs strongly across customer segments. Online TA and Groups have the highest cancellation proportions, consistent with more price-sensitive or bulk-booking customers. Corporate, Complementary, and Direct segments show far lower cancellation rates. This helps the model identify high-risk channels and suggests that hotels should tailor overbooking buffers and communication strategies by segment.
+
+
 # Step 3: Split the Data
 
 In a next step, we split our data set randomly for training and testing purposes. We use a 50% train and 50% test split, ensuring that we have enough data for the stacked model in the second step.
@@ -680,6 +720,7 @@ ggplot() +
 ```
 
 
+Interpretation: The logistic regression model performs extremely well on the test set, with 99.72% accuracy, sensitivity of 0.995, and specificity of 0.998. This means the model correctly identifies both cancellations and non-cancellations with very few mistakes, which is important for reducing costly overbooking errors. The expected profit per booking is approximately 50.46 under our defined cost structure, showing that the model remains effective even when accounting for the asymmetric cost of false negatives. Logistic regression also highlights key predictors—lead time, deposit type, and market segment—making it a strong and interpretable baseline for understanding cancellation behavior.
 
 ```{r}
 # 1) Long-Format bauen UND dabei die Reihenfolge der Metriken festlegen
@@ -749,6 +790,9 @@ lr_model_base <- glm(y ~ ., data = train_first_log, family = binomial)
 #lr_model_advanced <- glm(y ~ . + studytime:freetime + goout:freetime + studytime:goout, data = train_first_log, family = binomial)
 lr_model_step <- step(glm(y ~ ., data = train_first_log, family = binomial), trace = 0)
 
+## new line to avoid error added by marina: 
+lr_results_1 <- data.frame()
+
 thresholds <- seq(0, 1, by = 0.5)
 for (A in c("base", "step")) {
   for (t in thresholds) {
@@ -780,6 +824,7 @@ for (A in c("base", "step")) {
 #### Basic KNN
 
 ```{r}
+library(class)
 train_first_knn_x <- train_first_knn[,-83]
 test_first_knn_x <- test_first_knn[,-83]
 train_first_knn_y <- train_first_knn[,83]
@@ -868,6 +913,13 @@ ggplot() +
 
 
 ```
+
+
+Interpretation: 
+The basic KNN model performs much worse than logistic regression. Its accuracy is 77.9%, and the Kappa score (0.515) shows only moderate agreement with the true labels. KNN especially struggles to detect cancellations: sensitivity is 0.651, so it misses about one-third of all real cancellations.
+Specificity is higher (0.854), meaning it is better at identifying non-cancellations than cancellations, which a problem for overbooking decisions, where missed cancellations are costly. This weakness shows up in the profit metric as well: KNN produces only ~20.08 units of profit, less than half of logistic regression.
+
+Overall, KNN does not capture cancellation behavior well enough to be useful for hotel decisions.
 
 
 #### Advanced KNN

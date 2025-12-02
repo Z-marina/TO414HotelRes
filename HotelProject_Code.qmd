@@ -6,7 +6,7 @@ author:
   - name: Marco Molnar 
   - name: Marina Zhai
   - name: Omar Yousef
-  - name: Taeha Oh
+  - name: Grace Oh
 date: "December 4, 2025"
 format:
   html:

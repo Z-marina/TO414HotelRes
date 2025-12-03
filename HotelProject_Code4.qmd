@@ -1,0 +1,2100 @@
+---
+title: "Hotel Booking - Data Cleaning"
+subtitle: "Group: High5!"
+author:
+  - name: Luke Richardson
+  - name: Marco Molnar 
+  - name: Marina Zhai
+  - name: Omar Yousef
+  - name: Grace Oh
+date: "December 4, 2025"
+format:
+  html:
+    embed-resources: true
+    self-contained: true
+    self-contained-math: true
+    toc: true
+    toc-location: left
+    toc-depth: 6
+    theme: cosmo
+    code-fold: true
+    code-tools: true 
+highlight-style: dracula
+---
+
+# R Setup
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(skimr)
+library(forcats)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(C50)
+library(neuralnet)
+library(class)
+library(randomForest)
+library(kernlab)
+library(pROC)
+library(ipred)
+library(ggnewscale)
+library(corrplot)
+```
+
+# Step 0: Our Setup
+
+### Purpose of the Project: Why are We doing this Project?
+
+The goal of this project is to develop a predictive model that **estimates the probability that a newly received hotel reservation will be cancelled or not honored by the guest.** Cancellations and no-shows represent a major source of uncertainty for hotels, as they **directly affect occupancy, revenue, operational planning, and customer experience.** Traditional approaches to handling this uncertainty—such as fixed overbooking quotas—are often based on intuition rather than data-driven insights and can either lead to unused capacity or to costly overbooking situations.
+
+By building a **machine learning model that forecasts cancellation likelihood**, we aim to support hotels in making **more informed decisions about overbooking, capacity planning, and pricing**. A more accurate prediction of booking reliability allows hotels to sell the optimal number of rooms, reduce the risk of walking guests to other properties, stabilize revenue, and improve resource allocation in areas such as housekeeping and front-office operations. Ultimately, this enhances both financial performance and service quality.
+
+### Baseline Scenario
+
+If there is no algorithm predicting if a reservation will be canceled or not, we call this the baseline scenario. Let's have a look at the distribution of the dependent variable. We see that 37% of all reservations are canceled. We take this fraction as **probabilty that a reservation will be canceld (p)** and its counter probabilty as the **probability that a guest will end up staying in the hotel (1-p)**.
+
+```{r}
+##### Baseline Scenario
+data <- read.csv("hotel_booking.csv")
+data_analysis <- data %>%
+  count(is_canceled) %>%
+  mutate(percent = round(100 * n / sum(n), 1))
+
+ggplot(data_analysis, aes(x = factor(is_canceled), y = n, fill = factor(is_canceled))) +
+  geom_col(color = "black") +
+  geom_text(aes(label = paste0(n, " (", percent, "%)")),
+            vjust = -0.5, size = 5) +
+  labs(title = "Distribution of Dependent Variable",
+       x = "Outcome (is_canceled)", y = "Count", fill = "is_canceled") +
+  expand_limits(y = max(data_analysis$n) * 1.1) +
+  theme_minimal()
+
+```
+
+### Setting up a Profit Function
+
+To evaluate the economic impact of our prediction model, we assign a monetary value to each outcome of the confusion matrix. Our goal is to express how much profit (or loss) the hotel generates depending on whether a booking is correctly or incorrectly predicted as a cancellation. The following assumptions are intentionally simplified but realistic for hotel operations.
+
+#### Basic Financial Assumptions
+
+##### Average Daily Rate (ADR)**
+Let's first look at the Average Daily Rate (ADR) of all customer in the dataset:
+
+```{r}
+summary(data$adr)
+```
+
+So the ADR is \$100 per night.
+
+##### Variable Operating Costs
+Costs that occur only if a room is occupied (cleaning, utilities, amenities):
+
+- We assume \$30 variable costs per night
+
+So the profit from a correctly occupied room is therefore:
+
+- Profit per occupied room: \$100 − \$30 = \$70
+
+**This \$70 represents our baseline profit for a correctly predicted stay.**
+
+##### Cost of walking a guest (overbooking compensation)
+
+When the hotel is overbooked, one guest may need to be relocated (“walked”) to another hotel. This typically includes:
+
+- Paying the alternative hotel: \$100
+- Transport compensation (e.g., taxi): \$20
+- Additional compensation (voucher or goodwill gesture): \$20
+- So total walk cost: \$100 + \$20 + \$20 = \$140
+
+
+#### Economic Value of Each Confusion Matrix Outcome
+
+##### True Negative (TN) – correctly predicted non-cancellation
+
+The model predicts that the guest will show up, and they do.
+
+- Revenue: \$100
+- Variable cost: \$30
+- Profit(TN) = \$100 - \$30 = \$70
+
+This is the ideal and most common case.
+
+##### True Positive (TP) – correctly predicted cancellation
+
+The model predicts that the guest will cancel, and the guest indeed cancels.
+Because the hotel anticipates the cancellation, it can safely overbook and replace the cancelled booking with another guest. But that the next guest will end up taking his reservation is not guaranteed. Therefore we take advantage of the calculated probabilities above:
+
+- Profit(TP) = \$100 - \$30 = (1-p) \cdot \$70 + p \cdot -\$70
+- With p=0.37: Expected Profit of one TP = (1-0.37) \cdot \$70 + 0.37 \cdot -\$70
+
+##### False Negative (FN) – missed cancellation
+
+The model predicts that the guest will arrive, but the guest cancels. The hotel does not overbook and the room remains empty.
+
+- Revenue: \$0
+- Variable cost: \$0
+
+But the **economic loss** comes from the missed opportunity to sell this room:
+
+- Opportunity cost(FN) = -Profit(TN) = -Profit(TP) = \$-70
+
+##### False Positive (FP) – wrongly predicted cancellation → overbooking
+
+The model predicts cancellation, but the guest actually arrives. Because the hotel overbooks based on this prediction, it now has more guests than rooms, forcing it to walk one guest.
+
+Revenue:
+- Revenue from the guest who stays in the hotel: \$100
+
+Costs:
+- Variable cost for the occupied room: -\$30
+- Cost for external hotel: -\$100
+- Taxi reimbursement: -\$20
+- Compensation voucher: -\$20
+
+Profit(FP) = \$100 - \$30 - \$100 - \$20 - \$20 = -\$70
+
+Relative to the ideal profit of \$70, this represents a total economic loss of:
+
+- Total cost(FP) = -\$70 - \$70 = -\$140
+
+**This is significantly higher than the cost of an FN because a FP not only eliminates the expected profit but also introduces real financial penalties.**
+
+##### Resulting Profit Function
+
+A profit function based on these values is:
+
+$$
+Profit = 70 \cdot TN + 18.20 \cdot TP - 140 \cdot FP - 70 \cdot FN
+$$
+
+```{r}
+gain_function <- function(cm) {
+  return(70 * cm$table[1,1] + 18.2 * cm$table[2, 2] + cm$table[2, 1] * -140 + cm$table[1, 2] * -70)}
+
+results <- data.frame(model = integer(),
+                      threshold = numeric(),
+                      accuracy = numeric(),
+                      sensitivity = numeric(),
+                      specificity = numeric(),
+                      kappa = numeric(),
+                      gain = numeric(),
+                      stringsAsFactors = FALSE)
+lr_results <- results
+knn_results <- results
+ann_results <- results
+svm_results <- results
+dt_results <- results
+rf_results <- results
+
+```
+
+::: {.callout-tip title="Hotel Overbooking Problem"}
+To quantify the economic impact of model predictions, we assign a monetary value to each cell of the confusion matrix. We assume an average daily rate (ADR) of 100 € and variable operating costs of 30 € per occupied room, resulting in a profit of 70 € for a correctly occupied room. A true negative (correctly predicted non-cancellation) and a true positive (correctly predicted cancellation that can be compensated by overbooking) therefore both generate a profit of 70 € per booking.
+
+In contrast, a false negative (the model predicts “not cancelled”, but the booking is cancelled) leaves the room empty. In this case, the hotel generates no revenue and incurs no variable costs, resulting in a profit of 0 €. Relative to the ideal profit of 70 €, a false negative corresponds to an opportunity cost of 70 €.
+
+A false positive (the model predicts “cancelled”, but the guest actually arrives) is economically more severe. In an overbooked situation, the hotel must “walk” a guest to another property, which we model as a fixed cost of 140 € (covering the external room night, transportation, and compensation). Taking into account the profit loss relative to a correctly handled booking, the economic loss associated with a false positive is substantially higher than that of a false negative. This asymmetry justifies assigning a higher cost to false positives in the profit function and focusing on high specificity to keep the number of false positives low.
+:::
+
+
+# Step 1 & 2: Load and Clean the Data
+
+```{r}
+skim(data)
+summary(data)
+```
+
+### Artificial Variables
+
+The variables `name`, `email`, `phone-number` and `credit-card` are not real variables because they were imputed to protect personel data. For this reason, we will not consider these artificial variables as features, because we don't know ecactly how the imputation worked. It is only stated that these variables **... have been artificially created using a python and filled into the dataset**. 
+
+```{r}
+data <- data %>%
+  select(-name, -email, -phone.number,-credit_card)
+
+```
+
+
+### Handle N/As
+
+We can directly observe that for `agent` and especially for `company` we have a lot of missing values. The completion rate of the latter is just 5.6%. So the naive approach would be to just A) delete all observations where we have a missing value or B) ignore the two independent variables as predictors. But we believe these variables still have some interesting information and therefore we proceed as follows:
+
+### Company
+
+To handle the predictor variable `company`, which contains more than 80% missing values and a large number of rare categories, we grouped the companies into the five most common categories and combined all remaining companies into a single “Other” category. We then created dummy variables for these groups. This approach reduces noise from many low-frequency categories, prevents overfitting, and ensures that the model focuses on the most informative company categories while still retaining a meaningful comparison group.
+
+```{r}
+# Count non-NA companies and pick top 5
+top5 <- data %>%
+  filter(!is.na(company)) %>%
+  count(company, name = "n") %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5)
+
+# Create a named *character* vector: company_value → "Company_TopX"
+top5_names <- as.character(top5$company)     # convert to character
+names(top5_names) <- paste0("Company_Top", seq_along(top5_names))
+
+# Recode companies into Company_TopX or Company_Others
+data <- data %>%
+  mutate(
+    company_group = case_when(
+      company %in% top5$company ~ names(top5_names)[match(as.character(company), top5_names)],
+      TRUE ~ "Company_Others"   # includes NA automatically
+    )
+  )
+
+data$company_group <- as.factor(data$company_group)
+summary(data$company_group)
+data <- data %>%
+  select(-company)
+
+
+```
+
+### Agent
+
+```{r}
+# 1. Count non-NA agents and pick top 5
+top5_agent <- data %>%
+  filter(!is.na(agent)) %>%
+  count(agent, name = "n") %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 5)
+
+
+# 2. Create a named *character* vector: agent_value -> "Agent_TopX"
+top5_agent_vals <- as.character(top5_agent$agent)
+names(top5_agent_vals) <- paste0("Agent_Top", seq_along(top5_agent_vals))
+
+# 3. Recode agents into Agent_TopX or Agent_Others
+data <- data %>%
+  mutate(
+    agent_group = case_when(
+      as.character(agent) %in% top5_agent_vals ~
+        names(top5_agent_vals)[match(as.character(agent), top5_agent_vals)],
+      TRUE ~ "Agent_Others"   # includes NA automatically
+    ),
+    agent_group = factor(agent_group)
+  ) %>%
+  select(-agent)   # drop original numeric agent variable if you don’t need it anymore
+
+# Quick check
+summary(data$agent_group)
+
+```
+
+### Children
+
+```{r}
+data <- data %>%
+  filter(!is.na(children))
+```
+
+
+### Convert Character to Date
+
+We also notice that `reservation_status_data` is encoded as a character, but it is actually a date. 
+
+```{r}
+data$reservation_status_date <- as.Date(data$reservation_status_date)
+```
+
+
+### Convert Characters to Factors
+
+```{r}
+data <- data %>%
+  mutate(
+    hotel                   = as.factor(hotel),
+    arrival_date_month      = as.factor(arrival_date_month),
+    meal                    = as.factor(meal),
+    country                 = as.factor(country),
+    market_segment          = as.factor(market_segment),
+    distribution_channel    = as.factor(distribution_channel),
+    reserved_room_type      = as.factor(reserved_room_type),
+    assigned_room_type      = as.factor(assigned_room_type),
+    deposit_type            = as.factor(deposit_type),
+    customer_type           = as.factor(customer_type),
+    reservation_status      = as.factor(reservation_status)
+  )
+summary(data)
+```
+
+```{r}
+data <- subset(data, assigned_room_type != "L")
+data <- subset(data, assigned_room_type != "P")
+data <- subset(data, distribution_channel != "Undefined")
+```
+
+### Data Leakage Problem
+
+As we converted `reservation_status` to factors and have a look at the `str()` report above, we see that we have three differnt levels. Let's have a closer look at the variable `reservation_status`:
+
+```{r}
+summary(data$reservation_status)
+```
+
+We see that this variable contains the information if a customer has cancelled his booking or not. This seems weird because this information should capture **only our dependent variable**. 
+
+```{r}
+data <- data %>%
+  mutate(
+    reservation_status = factor(reservation_status),
+    # Lump "Canceled" + "No-Show" into one level
+    reservation_status_lumped = fct_collapse(
+      reservation_status,
+      "Canceled_or_NoShow" = c("Canceled", "No-Show"),
+      "Check-Out"          = "Check-Out"
+    )
+  )
+data <- data %>%
+  mutate(
+    canceled_from_status = if_else(
+      reservation_status_lumped == "Canceled_or_NoShow",
+      1L,  # canceled
+      0L   # not canceled (e.g., "Check-Out")
+    )
+  )
+data <- data %>%
+  mutate(
+    same_info = (is_canceled == canceled_from_status)
+  )
+
+# Proportion of rows where they agree
+mean(data$same_info)
+
+# Cross-tabulation for more detail
+table(is_canceled = data$is_canceled,
+      status_binary = data$canceled_from_status)
+
+```
+
+To examine whether the two variables `is_canceled` (our dependent variable) and `reservation_status` contain the same underlying information, we first recoded reservation_status into a binary factor called `status_binary`. In this step, the levels "Canceled" and "No-Show" were grouped together as 1, while "Check-Out" was coded as 0. This allowed the two variables to be placed on the same numerical scale (0/1). We then created a cross-tabulation comparing is_canceled with status_binary. The resulting table shows a perfect match: every observation where is_canceled = 1 also has status_binary = 1, and every case where is_canceled = 0 corresponds to status_binary = 0. **This confirms that the factor variable reservation_status is providing the exact same information as is_canceled, meaning reservation_status is redundant and can be removed from further modeling to avoid information leakage**.
+
+```{r}
+data <- data %>%
+  select(-reservation_status, -reservation_status_lumped, -canceled_from_status, -same_info)
+```
+
+### Country
+
+To reduce the dimensionality of the categorical variable country, we grouped countries according to their contribution to the total frequency in the dataset. First, we ranked all countries by how often they appear. We then identified the smallest set of countries whose cumulative frequency accounts for approximately 80% of all observations. These high-frequency countries were kept as individual factor levels, because they contain most of the information. All remaining low-frequency countries—together with any missing values—were pooled into a single category named “Country_Other”. This approach retains the most informative variation in the data while preventing excessive sparsity, improving model stability and interpretability. **Using this approach, we reduced the dimensionality from 178 levels to just 8 levels and still kept the relevant information.**
+
+```{r}
+# Step 1: Count countries and compute cumulative percentage
+country_freq <- data %>%
+  count(country, name = "n") %>%
+  arrange(desc(n)) %>%
+  mutate(
+    pct = n / sum(n),
+    cum_pct = cumsum(pct)
+  )
+
+# Step 2: Select countries contributing to ~80%
+top_countries <- country_freq %>%
+  filter(cum_pct <= 0.80) %>%
+  pull(country)
+
+# Step 3: Recode into Top countries vs Other
+data <- data %>%
+  mutate(
+    country_group = case_when(
+      country %in% top_countries ~ as.character(country),
+      TRUE ~ "Country_Other"
+    ),
+    country_group = as.factor(country_group)
+  )
+
+# Optional: remove original variable
+# data <- data %>% select(-country)
+
+# Check final distribution
+summary(data$country_group)
+data <- data %>% select(-country)
+str(data)
+
+```
+
+### Important! Perfect Multicollinearity
+
+::: {.callout-important title="Handling Perfect Multicollinearity in Our Logistic Regression Model"}
+During the development of our logistic regression model, we encountered unexpected results in the initial model summary. Almost all predictors showed extremely high p-values, and many coefficient estimates were unstable or close to zero. Despite this, the predictive performance appeared artificially strong at first, which prompted a deeper investigation. The unusual combination of non-significant coefficients and suspiciously high predictive accuracy suggested a structural issue in the data rather than a modelling error. This led us to suspect the presence of perfect multicollinearity.
+
+To verify this, we calculated the Variance Inflation Factor (VIF) for all predictors. VIF is a standard diagnostic tool used to identify whether a predictor is highly correlated with other predictors in the model. In a well-specified model, VIF values should generally remain below 5–10. However, our analysis showed that several variables produced extremely high VIF scores, in some cases far beyond acceptable thresholds. This confirmed that certain predictors were linearly dependent on one another, meaning the model could not uniquely estimate their individual effects.
+
+A closer inspection revealed the source of the problem: many of the date- and time-related variables were strongly correlated by definition. For example, `arrival_date_month`, `arrival_date_day_of_month`, `arrival_date_week_number`, and `arrival_date_year` all contain overlapping temporal information and therefore explain essentially the same underlying structure. Additionally, reservation_status_date and assigned_room_type contributed further redundancy. When multiple variables encode the same information in slightly different forms, the model struggles to separate their effects, which leads to perfect or near-perfect multicollinearity.
+:::
+
+```{r}
+data <- data %>%
+  select(-arrival_date_month,
+         -arrival_date_day_of_month,
+         -arrival_date_week_number,
+         -arrival_date_year,
+         -reservation_status_date,
+         -assigned_room_type)
+```
+
+
+### Change Name of Dependent Variable
+
+For simplicity, we change the name of the dependent variable to `y`.
+
+```{r}
+data$y <- data$is_canceled
+data <- data %>%
+  select(-is_canceled)
+```
+
+### Select Randomly 20% of Data for Faster Rendering
+```{r}
+set.seed(12345)
+data <- data %>%
+  sample_frac(0.2)
+str(data)
+```
+
+### Final Datasets for Different Algorithms
+
+#### Logistic Regression
+
+::: {.callout-important title="Checklist for Logistic Regression"}
+-   Dependent Variable can be numeric (0/1)
+-   Min-Max scaling **is not** necessary
+-   Dummy Variables **is not** necessary
+:::
+
+```{r}
+data_log <- data
+```
+
+```{r}
+data_corr <- data_log %>%
+  select(y,lead_time,is_repeated_guest,stays_in_weekend_nights,customer_type)
+data_corr
+```
+
+```{r}
+df_numeric <- data_corr[sapply(data_corr, is.numeric)]
+cor_matrix <- cor(df_numeric, use = "complete.obs")
+corrplot(cor_matrix, method = "color", addCoef.col = "black")
+```
+
+#### ANN & KNN
+
+::: {.callout-important title="Checklist for ANN and KNN"}
+-   Neural networks are sensitive to variable ranges.
+-   Dependent Variable can be numeric (0/1)
+-   Min-Max scaling **is** necessary
+-   Dummy Variables **is** necessary
+:::
+
+We first drop the dependent variable, then one-hot encoding all the features to create dummy variables for all categorical variables. In a next step, we use min-max scaling and add back the dependent variable:
+
+```{r}
+data_ann <- data
+
+data_ann_no_y <- data_ann %>% select(-y) # drop the dependent variable
+data_ann <- as.data.frame(model.matrix(~ . -1, data = data_ann_no_y))
+
+# scale variables to ensure each variable has minimal value of 0 and maximum value of 1
+minmax <- function(x){
+  (x-min(x))/(max(x)-min(x))
+}
+
+data_ann <- as.data.frame(lapply(data_ann, minmax))
+data_ann$y <- data$y
+
+data_ann <- data_ann %>%
+  select(-distribution_channelUndefined,-reserved_room_typeL, -reserved_room_typeP)
+
+data_knn <- data_ann
+```
+
+```{r}
+str(data_ann)
+```
+
+#### Supported Vector Machines
+
+::: {.callout-important title="Checklist for SVM"}
+-   Dependent Variable **must be a two level factor**
+-   Min-Max scaling **is** necessary
+-   Dummy Variables **is** necessary
+:::
+
+SVM requires the same type of preprocessed feature data as ANN and KNN — fully numeric, dummy-coded for nominal variables, and standardised — because all three methods depend on distance or gradient-based optimisation. The only difference is that SVM needs the dependent variable to be a binary factor, whereas ANN and KNN use a numeric 0/1 target.
+
+```{r}
+data_svm <- data_ann
+
+# Dependent variable as factor
+data_svm$y <- as.factor(data_svm$y)
+```
+
+#### Decision Trees & Random Forest
+
+::: {.callout-important title="Checklist for Decision Trees & Random Forest"}
+-   Dependent Variable **should be a two level factor**
+-   Min-Max scaling **is not** necessary
+-   Dummy Variables **is not** necessary
+:::
+
+```{r}
+data_dt <- data
+
+data_dt$y <- as.factor(data_dt$y)
+data_rf <- data_dt
+```
+
+## Doing some EDA! 
+
+```{r}
+ggplot(data, aes(x = lead_time, fill = as.factor(y))) +
+  geom_histogram(bins = 40, color = "white") +
+  scale_fill_manual(values = c("#70AD47", "#C00000")) +
+  labs(title = "Lead Time Distribution by Cancellation Status",
+       x = "Lead Time (days)", y = "Count")
+
+```
+
+Interpretation: Reservations with longer lead times show a substantially higher cancellation rate. Short-lead reservations (0–30 days) rarely cancel, but far-future bookings show a clear surge in cancellations. This suggests that guests with more time before arrival are more likely to change plans, making lead_time one of the strongest early predictors of cancellation behavior. Operationally, long-horizon bookings should be weighted more heavily in overbooking decisions.
+
+
+```{r}
+ggplot(data, aes(x = deposit_type, fill = as.factor(y))) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("#70AD47", "#C00000")) +
+  labs(title = "Cancellation Rate by Deposit Type",
+       y = "Proportion")
+```
+
+
+Interpretation: Cancellation behavior varies dramatically by deposit policy. Non-refundable bookings almost never cancel, while refundable and no-deposit bookings show much higher cancellation rates. This validates that cancellation incentives matter: when customers bear financial risk, cancellations collapse. Deposit_type is therefore a high-impact categorical predictor and also a lever hotels can adjust to reduce financial losses.
+
+
+```{r}
+ggplot(data, aes(x = market_segment, fill = as.factor(y))) +
+  geom_bar(position = "fill") +
+  scale_fill_manual(values = c("#70AD47", "#C00000")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Cancellation Rate by Market Segment",
+       y = "Proportion")
+
+```
+
+Booking behavior differs strongly across customer segments. Online TA and Groups have the highest cancellation proportions, consistent with more price-sensitive or bulk-booking customers. Corporate, Complementary, and Direct segments show far lower cancellation rates. This helps the model identify high-risk channels and suggests that hotels should tailor overbooking buffers and communication strategies by segment.
+
+
+# Step 3: Split the Data
+
+In a next step, we split our data set randomly for training and testing purposes. We use a 50% train and 50% test split, ensuring that we have enough data for the stacked model in the second step.
+
+```{r}
+set.seed(12345) # set seed for reputability
+
+trainprop <- 0.50 # for first split
+train_rows <- sample(1:nrow(data_log), trainprop*nrow(data_log))
+
+# LR
+train_first_log <- data_log[train_rows,] # create train data set for first models
+test_first_log <- data_log[-train_rows,] # create test data set for first models
+
+# ANN
+train_first_ann <- data_ann[train_rows,]
+test_first_ann <- data_ann[-train_rows,]
+
+# KNN
+train_first_knn <- data_knn[train_rows,]
+#train_first_knn <- train_first_knn %>%
+  #select(-distribution_channelUndefined)
+
+test_first_knn <- data_knn[-train_rows,]
+#test_first_knn <- test_first_knn %>%
+  #select(-distribution_channelUndefined)
+
+# SVM
+train_first_svm <- data_svm[train_rows,]
+test_first_svm <- data_svm[-train_rows,]
+
+# Decision Tree
+train_first_dt <- data_dt[train_rows,]
+test_first_dt <- data_dt[-train_rows,]
+
+# Random Forest
+train_first_rf <- data_rf[train_rows,]
+test_first_rf <- data_rf[-train_rows,]
+```
+
+# Step 4, 5 & 6: Build Models, Make Predictions and Evaluate
+
+### Logistic Regression (LR)
+
+
+```{r}
+lr_model_base <- glm(y ~ ., data = train_first_log, family = "binomial")
+
+lr_prob_base <- predict(
+  lr_model_base,
+  newdata = test_first_log,
+  type = "response"
+)
+
+```
+```{r}
+summary(lr_model_base)
+```
+
+Now we can create a confusion matrix, using a standard threshold of 0.5
+```{r}
+# Confusion Matrix
+lr_pred_base <- ifelse(lr_prob_base >= 0.5, 1, 0)
+
+cm_lr_base <- confusionMatrix(
+  as.factor(lr_pred_base),
+  factor(test_first_log$y, levels = c(0, 1)),
+  positive = "1"
+)
+
+cm_lr_base
+```
+
+```{r}
+summary_table <- data.frame(
+  model       = character(),
+  accuracy    = numeric(),
+  kappa       = numeric(),
+  sensitivity = numeric(),
+  specificity = numeric(),
+  profit = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Create a summary table
+baseline_logistic_regression <- data.frame(
+  model       = "Logistic Regression",
+  accuracy    = cm_lr_base$overall["Accuracy"],
+  kappa       = cm_lr_base$overall["Kappa"],
+  sensitivity = cm_lr_base$byClass["Sensitivity"],
+  specificity = cm_lr_base$byClass["Specificity"],
+  profit = gain_function(cm_lr_base)/(cm_lr_base$table[1,1]+cm_lr_base$table[1,2]+cm_lr_base$table[2,1]+cm_lr_base$table[2,2])
+)
+
+
+summary_table <- rbind(summary_table, baseline_logistic_regression)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+
+Interpretation: The logistic regression model performs extremely well on the test set, with 99.72% accuracy, sensitivity of 0.995, and specificity of 0.998. This means the model correctly identifies both cancellations and non-cancellations with very few mistakes, which is important for reducing costly overbooking errors. The expected profit per booking is approximately 50.46 under our defined cost structure, showing that the model remains effective even when accounting for the asymmetric cost of false negatives. Logistic regression also highlights key predictors—lead time, deposit type, and market segment—making it a strong and interpretable baseline for understanding cancellation behavior.
+
+```{r}
+# 1) Long-Format bauen UND dabei die Reihenfolge der Metriken festlegen
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+
+
+
+### KNN
+
+#### Basic KNN
+
+```{r}
+train_first_knn_x <- train_first_knn[,-59]
+test_first_knn_x <- test_first_knn[,-59]
+train_first_knn_y <- train_first_knn[,59]
+test_first_knn_y <- test_first_knn[,59]
+
+model_knn_a <- knn(train = train_first_knn_x, test = test_first_knn_x, cl = train_first_knn_y, k = 20, prob = TRUE)
+y_true <- test_first_knn_y
+y_pred <- model_knn_a
+
+model_knn_a_conf <- confusionMatrix(y_pred, as.factor(y_true), positive = "1")
+model_knn_a_conf
+
+model_knn_a_prob <- ifelse(model_knn_a == "1", attr(model_knn_a, "prob"), 1 - attr(model_knn_a, "prob"))
+
+```
+
+```{r}
+knn_baseline_row <- data.frame(
+  model       = "Basic KNN",
+  accuracy    = model_knn_a_conf$overall["Accuracy"],
+  kappa       = model_knn_a_conf$overall["Kappa"],
+  sensitivity = model_knn_a_conf$byClass["Sensitivity"],
+  specificity = model_knn_a_conf$byClass["Specificity"],
+  profit = gain_function(model_knn_a_conf)/(model_knn_a_conf$table[1,1]+model_knn_a_conf$table[1,2]+model_knn_a_conf$table[2,1]+model_knn_a_conf$table[2,2])
+)
+
+summary_table <- rbind(summary_table, knn_baseline_row)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+```
+
+
+Interpretation: 
+The basic KNN model performs much worse than logistic regression. Its accuracy is 77.9%, and the Kappa score (0.515) shows only moderate agreement with the true labels. KNN especially struggles to detect cancellations: sensitivity is 0.651, so it misses about one-third of all real cancellations.
+Specificity is higher (0.854), meaning it is better at identifying non-cancellations than cancellations, which a problem for overbooking decisions, where missed cancellations are costly. This weakness shows up in the profit metric as well: KNN produces only ~20.08 units of profit, less than half of logistic regression.
+
+Overall, KNN does not capture cancellation behavior well enough to be useful for hotel decisions.
+
+
+#### Advanced KNN
+
+```{r}
+K <- seq (1, 200, by = 10)
+
+for (t in K) {
+  knn_model_a <- knn(train = train_first_knn_x, test = test_first_knn_x, cl = train_first_knn_y, k = t, prob = TRUE)
+  knn_y_true <- test_first_knn_y
+  knn_y_pred <- knn_model_a
+  cm <- confusionMatrix(as.factor(knn_y_pred), as.factor(knn_y_true), positive = "1")
+  knn_gain <- gain_function(cm)
+  knn_kappa_a <- as.numeric(cm$overall["Kappa"])
+  knn_accuracy_a <- as.numeric(cm$overall["Accuracy"])
+  knn_sensitivity_a <- as.numeric(cm$byClass["Sensitivity"])
+  knn_specificity_a <- as.numeric(cm$byClass["Specificity"])
+  knn_results <- rbind(knn_results, data.frame(model = "knn_a", threshold = t,
+                                                   kappa = knn_kappa_a,
+                                                   gain = knn_gain,
+                                                   accuracy = knn_accuracy_a,
+                                                   sensitivity = knn_sensitivity_a,
+                                                   specificity = knn_specificity_a,
+                                                   stringsAsFactors = FALSE, row.names = NULL))
+  }
+knn_maxgain_results <- knn_results[which.max(knn_results$gain), ]
+knn_maxkappa_results <- knn_results[which.max(knn_results$kappa), ]
+knn_maxgain <- max(knn_results$gain)
+
+knn_prob <- ifelse(knn_model_a == "1", attr(knn_model_a, "prob"), 1 - attr(knn_model_a, "prob"))
+```
+
+
+```{r}
+best_k <- knn_maxkappa_results$threshold
+cat("Best k by Kappa:", best_k, "\n")
+
+best_knn_pred <- knn(
+  train = train_first_knn_x,
+  test  = test_first_knn_x,
+  cl    = train_first_knn_y,
+  k     = best_k,
+  prob  = TRUE
+)
+
+cm_best_k_kappa <- confusionMatrix(
+  as.factor(best_knn_pred),
+  as.factor(test_first_knn_y),
+  positive = "1"
+)
+
+cm_best_k_kappa
+
+knn_prob_kappa <- ifelse(
+  best_knn_pred == "1",
+  attr(best_knn_pred, "prob"),
+  1 - attr(best_knn_pred, "prob")
+)
+```
+
+```{r}
+best_k_profit <- knn_maxgain_results$threshold
+cat("Best k by Profit:", best_k_profit, "\n")
+
+best_knn_profit_pred <- knn(
+  train = train_first_knn_x,
+  test  = test_first_knn_x,
+  cl    = train_first_knn_y,
+  k     = best_k_profit,
+  prob  = TRUE
+)
+
+cm_best_k_profit <- confusionMatrix(
+  as.factor(best_knn_profit_pred),
+  as.factor(test_first_knn_y),
+  positive = "1"
+)
+
+cm_best_k_profit
+
+knn_prob_profit <- ifelse(
+  best_knn_profit_pred == "1",
+  attr(best_knn_profit_pred, "prob"),
+  1 - attr(best_knn_profit_pred, "prob"))
+```
+
+
+```{r}
+ggplot(knn_results, aes(x = threshold, y = kappa)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = knn_maxkappa_results$threshold, linetype = "dashed") +
+  labs(title = "KNN performance by k measured with Kappa", x = "K", y = "Kappa") +
+  theme_minimal()
+
+ggplot(knn_results, aes(x = threshold, y = gain)) +
+  geom_line() +
+  geom_point() +
+  geom_vline(xintercept = knn_maxgain_results$threshold, linetype = "dashed") +
+  scale_x_continuous(limits = c(0, 210)) +
+  labs(title = "KNN performance by k measured by Profit", x = "K", y = "Profit") +
+  theme_minimal()
+
+
+```
+
+```{r}
+knn_best_k_kappa <- data.frame(
+  model       = "KNN best k for kappa",
+  accuracy    = cm_best_k_kappa$overall["Accuracy"],
+  kappa       = cm_best_k_kappa$overall["Kappa"],
+  sensitivity = cm_best_k_kappa$byClass["Sensitivity"],
+  specificity = cm_best_k_kappa$byClass["Specificity"],
+  profit = gain_function(cm_best_k_kappa)/(cm_best_k_kappa$table[1,1]+cm_best_k_kappa$table[1,2]+cm_best_k_kappa$table[2,1]+cm_best_k_kappa$table[2,2])
+)
+
+# An bestehende summary_table anhängen
+summary_table <- rbind(summary_table, knn_best_k_kappa)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+```
+
+```{r}
+knn_best_k_profit <- data.frame(
+  model       = "KNN best k for profit",
+  accuracy    = cm_best_k_profit$overall["Accuracy"],
+  kappa       = cm_best_k_profit$overall["Kappa"],
+  sensitivity = cm_best_k_profit$byClass["Sensitivity"],
+  specificity = cm_best_k_profit$byClass["Specificity"],
+  profit = gain_function(cm_best_k_profit)/(cm_best_k_profit$table[1,1]+cm_best_k_profit$table[1,2]+cm_best_k_profit$table[2,1]+cm_best_k_profit$table[2,2])
+)
+
+# An bestehende summary_table anhängen
+summary_table <- rbind(summary_table, knn_best_k_profit)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+```
+
+### ANN
+
+#### Basic ANN
+
+```{r}
+model_ann_base <- neuralnet(y ~ ., data = train_first_ann)
+plot(model_ann_base)
+```
+
+```{r}
+can_pred_ann <- predict(model_ann_base, test_first_ann)
+can_bin_pred <- ifelse(can_pred_ann >= 0.5, 1, 0)
+ANNmodel <- confusionMatrix(as.factor(can_bin_pred), as.factor(test_first_ann$y), positive = "1")
+ANNmodel
+```
+
+#### Advanced ANN
+
+```{r}
+# Ergebnistabelle ohne Threshold-Spalte
+ann_results <- data.frame(
+  model       = character(),
+  accuracy    = numeric(),
+  sensitivity = numeric(),
+  specificity = numeric(),
+  kappa       = numeric(),
+  gain        = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# verschiedene ANN-Architekturen
+hidden_layers <- list(
+  c(6, 4)
+  # z.B. weitere Modelle:
+  # c(4),
+  # c(8, 4),
+  # c(10, 6, 3)
+)
+
+# Zielvariable + Testfeatures
+train_first_ann$y <- factor(train_first_ann$y, levels = c(0, 1))
+test_first_ann$y  <- factor(test_first_ann$y,  levels = c(0, 1))
+x_test <- subset(test_first_ann, select = -y)
+y_test <- test_first_ann$y
+
+for (h in hidden_layers) {
+  
+  # eindeutiger Modellname, z.B. "ann_6-4"
+  model_id <- paste0("ann_", paste(h, collapse = "-"))
+  
+  # 1) Modell trainieren
+  nn_fit <- neuralnet(
+    y ~ .,
+    data          = train_first_ann,
+    hidden        = h,
+    act.fct       = "logistic",
+    linear.output = FALSE,
+    stepmax       = 1e6
+  )
+  
+  # 2) Wahrscheinlichkeiten einmal berechnen
+  pred_raw <- compute(nn_fit, x_test)$net.result
+  
+  prob_test <- if (is.matrix(pred_raw) && ncol(pred_raw) == 2) {
+    as.vector(pred_raw[, 2])     # P(y = 1), falls zwei Ausgänge
+  } else {
+    as.vector(pred_raw)          # sonst direkt
+  }
+  
+  # optional: Probs für diese ANN-Version speichern
+  assign(paste0("ann_prob_", model_id), prob_test)
+  
+  # 3) Klassifikation mit fixem Threshold 0.5
+  pred_num  <- ifelse(prob_test >= 0.5, 1, 0)
+  pred_fact <- factor(pred_num, levels = c(0, 1))
+  
+  cm <- confusionMatrix(pred_fact, y_test, positive = "1")
+  
+  acc   <- as.numeric(cm$overall["Accuracy"])
+  sens  <- as.numeric(cm$byClass["Sensitivity"])
+  spec  <- as.numeric(cm$byClass["Specificity"])
+  kappa <- as.numeric(cm$overall["Kappa"])
+  gain  <- gain_function(cm)
+  
+  ann_results <- rbind(
+    ann_results,
+    data.frame(
+      model       = model_id,
+      accuracy    = acc,
+      sensitivity = sens,
+      specificity = spec,
+      kappa       = kappa,
+      gain        = gain,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+ann_results
+
+```
+
+### SVM
+
+Train the SVM models:
+```{r}
+for (k in c("rbfdot","polydot","vanilladot"))
+  assign(paste0("svm_model_", k), ksvm(y ~ ., data = train_first_svm, kernel = k, prob.model = TRUE))
+```
+
+
+```{r}
+thresholds <- seq(0, 1, by = 0.1)
+
+for (k in c("rbfdot","polydot","vanilladot")) {
+  for (t in thresholds) {
+    assign(paste0("svm_prob_", k), predict(get(paste0("svm_model_", k)), test_first_svm, type = "probabilities"))
+    assign(paste0("svm_pred_", k), ifelse(get(paste0("svm_prob_", k))[,2] >= t, 1, 0))
+    assign(paste0("svm_cm_", k), confusionMatrix(as.factor(get(paste0("svm_pred_", k))), as.factor(test_first_svm$y), positive = "1"))
+    cm <- confusionMatrix(as.factor(get(paste0("svm_pred_", k))), as.factor(test_first_svm$y), positive = "1")
+    assign(paste0("svm_gain_", k), gain_function(cm))
+    assign(paste0("svm_kappa_", k), as.numeric(cm$overall["Kappa"]))
+    assign(paste0("svm_accuracy_", k), as.numeric(cm$overall["Accuracy"]))
+    assign(paste0("svm_sensitivity_", k), as.numeric(cm$byClass["Sensitivity"]))
+    assign(paste0("svm_specificity_", k), as.numeric(cm$byClass["Specificity"]))
+    svm_results <- rbind(svm_results, data.frame(model = k,
+                                                   threshold = t,
+                                                   accuracy = get(paste0("svm_accuracy_", k)),
+                                                   sensitivity = get(paste0("svm_sensitivity_", k)),
+                                                   specificity = get(paste0("svm_specificity_", k)),
+                                                   kappa = get(paste0("svm_kappa_", k)),
+                                                   gain = get(paste0("svm_gain_", k)),
+                                                   stringsAsFactors = FALSE, row.names = NULL))
+  }
+  assign(paste0("svm_standard_", k), head(svm_results[svm_results$model == k & svm_results$threshold == 0.5, ], 1))
+  assign(paste0("svm_maxgain_", k), svm_results[svm_results$model == k, ][which.max(svm_results$gain[svm_results$model == k]), ])
+  assign(paste0("svm_maxkappa_", k), svm_results[svm_results$model == k, ][which.max(svm_results$kappa[svm_results$model == k]), ])
+}
+
+svm_maxgain_results <- svm_results[which.max(svm_results$gain), ]
+svm_maxkappa_results <- svm_results[which.max(svm_results$kappa), ]
+svm_maxgain <- max(svm_results$gain)
+```
+```{r}
+# Sicherstellen: Zielvariable als Faktor mit Levels 0/1
+train_first_svm$y <- factor(train_first_svm$y, levels = c(0, 1))
+test_first_svm$y  <- factor(test_first_svm$y,  levels = c(0, 1))
+
+# -------------------------------
+# 1. SVM-Modelle trainieren
+# -------------------------------
+
+set.seed(123)
+
+svm_model_rbfdot <- ksvm(
+  y ~ .,
+  data       = train_first_svm,
+  kernel     = "rbfdot",
+  prob.model = TRUE
+)
+
+svm_model_polydot <- ksvm(
+  y ~ .,
+  data       = train_first_svm,
+  kernel     = "polydot",
+  prob.model = TRUE
+)
+
+svm_model_vanilladot <- ksvm(
+  y ~ .,
+  data       = train_first_svm,
+  kernel     = "vanilladot",
+  prob.model = TRUE
+)
+
+# -------------------------------
+# 2. Threshold-Schleife + Ergebnisse
+# -------------------------------
+
+thresholds <- seq(0, 1, by = 0.1)
+
+svm_results <- data.frame(
+  model       = character(),
+  threshold   = numeric(),
+  accuracy    = numeric(),
+  sensitivity = numeric(),
+  specificity = numeric(),
+  kappa       = numeric(),
+  gain        = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Hilfsfunktion: Wahrscheinlichkeiten für y = 1 ausgeben
+get_prob_pos <- function(model, newdata) {
+  prob_mat <- predict(model, newdata, type = "probabilities")
+  # Annahme: zweite Spalte = Klasse "1"
+  as.vector(prob_mat[, 2])
+}
+
+# Alle Kernel in einer Liste managen
+svm_models <- list(
+  rbfdot    = svm_model_rbfdot,
+  polydot   = svm_model_polydot,
+  vanilladot = svm_model_vanilladot
+)
+
+# Liste zum Speichern der Wahrscheinlichkeiten pro Kernel (einmal berechnet)
+svm_prob_list <- list()
+
+for (k in names(svm_models)) {
+  
+  model <- svm_models[[k]]
+  
+  # 1) Wahrscheinlichkeiten für das Testset EINMAL berechnen
+  prob_pos <- get_prob_pos(model, test_first_svm)
+  svm_prob_list[[k]] <- prob_pos   # hier speicherst du die Probabilities für jedes Modell
+  
+  # 2) Über Thresholds iterieren
+  for (t in thresholds) {
+    
+    pred_num  <- ifelse(prob_pos >= t, 1, 0)
+    pred_fact <- factor(pred_num, levels = c(0, 1))
+    
+    cm <- confusionMatrix(pred_fact, test_first_svm$y, positive = "1")
+    
+    acc   <- as.numeric(cm$overall["Accuracy"])
+    sens  <- as.numeric(cm$byClass["Sensitivity"])
+    spec  <- as.numeric(cm$byClass["Specificity"])
+    kap   <- as.numeric(cm$overall["Kappa"])
+    gain  <- gain_function(cm)
+    
+    svm_results <- rbind(
+      svm_results,
+      data.frame(
+        model       = k,
+        threshold   = t,
+        accuracy    = acc,
+        sensitivity = sens,
+        specificity = spec,
+        kappa       = kap,
+        gain        = gain,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+# -------------------------------
+# 3. Standard-Threshold 0.5 auswerten
+# -------------------------------
+
+svm_standard_results <- subset(svm_results, threshold == 0.5)
+svm_standard_results
+
+# -------------------------------
+# 4. Beste Modelle nach Gain & Kappa
+# -------------------------------
+
+# Global bestes Ergebnis nach Gain/Kappa
+svm_maxgain_results  <- svm_results[which.max(svm_results$gain), ]
+svm_maxkappa_results <- svm_results[which.max(svm_results$kappa), ]
+
+svm_maxgain  <- max(svm_results$gain)
+svm_maxkappa <- max(svm_results$kappa)
+
+svm_maxgain_results
+svm_maxkappa_results
+
+# -------------------------------
+# 5. Probabilities für die besten Modelle
+# -------------------------------
+
+# Bester Kernel nach Gain
+best_kernel_gain   <- svm_maxgain_results$model
+best_thresh_gain   <- svm_maxgain_results$threshold
+best_prob_gain     <- svm_prob_list[[best_kernel_gain]]
+
+# Bester Kernel nach Kappa
+best_kernel_kappa  <- svm_maxkappa_results$model
+best_thresh_kappa  <- svm_maxkappa_results$threshold
+best_prob_kappa    <- svm_prob_list[[best_kernel_kappa]]
+
+# Beispiel: Vorhersagen für bestes Gain-Modell mit dem optimalen Threshold
+best_pred_gain <- factor(
+  ifelse(best_prob_gain >= best_thresh_gain, 1, 0),
+  levels = c(0, 1)
+)
+
+cm_best_gain <- confusionMatrix(best_pred_gain, test_first_svm$y, positive = "1")
+cm_best_gain
+
+```
+
+
+
+```{r}
+svm_maxgain_rbfdot_table <- data.frame(
+  model       = "SVM rbfdot max profit",
+  accuracy    = svm_maxgain_rbfdot["accuracy"],
+  kappa       = svm_maxgain_rbfdot["kappa"],
+  sensitivity = svm_maxgain_rbfdot["sensitivity"],
+  specificity = svm_maxgain_rbfdot["specificity"],
+  profit = svm_maxgain_rbfdot["gain"]/nrow(test_first_svm)
+)
+
+svm_maxgain_rbfdot_table$profit <- svm_maxgain_rbfdot_table$gain
+
+svm_maxgain_rbfdot_table <- svm_maxgain_rbfdot_table %>%
+  select(-gain)
+
+
+# An bestehende summary_table anhängen
+summary_table <- rbind(summary_table, svm_maxgain_rbfdot_table)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+
+```{r}
+svm_maxgain_polydot_table <- data.frame(
+  model       = "SVM polydot max profit",
+  accuracy    = svm_maxgain_polydot["accuracy"],
+  kappa       = svm_maxgain_polydot["kappa"],
+  sensitivity = svm_maxgain_polydot["sensitivity"],
+  specificity = svm_maxgain_polydot["specificity"],
+  profit = svm_maxgain_polydot["gain"]/nrow(test_first_svm)
+)
+
+svm_maxgain_polydot_table$profit <- svm_maxgain_polydot_table$gain
+
+svm_maxgain_polydot_table <- svm_maxgain_polydot_table %>%
+  select(-gain)
+
+
+# An bestehende summary_table anhängen
+summary_table <- rbind(summary_table, svm_maxgain_polydot_table)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+```{r}
+svm_maxgain_vanilladot_table <- data.frame(
+  model       = "SVM vanilladot max profit",
+  accuracy    = svm_maxgain_vanilladot["accuracy"],
+  kappa       = svm_maxgain_vanilladot["kappa"],
+  sensitivity = svm_maxgain_vanilladot["sensitivity"],
+  specificity = svm_maxgain_vanilladot["specificity"],
+  profit = svm_maxgain_vanilladot["gain"]/nrow(test_first_svm)
+)
+
+svm_maxgain_vanilladot_table$profit <- svm_maxgain_vanilladot_table$gain
+
+svm_maxgain_vanilladot_table <- svm_maxgain_vanilladot_table %>%
+  select(-gain)
+
+
+# An bestehende summary_table anhängen
+summary_table <- rbind(summary_table, svm_maxgain_vanilladot_table)
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),         # profit ganz rechts
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+# 3) Heatmap mit zwei Farbskalen
+ggplot() +
+  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
+
+  # Grüne Kachel für Profit
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+###Random forest
+
+```{r}
+# Random Forest (train + prob of class "1")
+rf_model <- randomForest(y ~ ., data = train_first_rf)
+p_rf <- predict(rf_model, newdata = test_first_rf, type = "prob")[, 2]
+
+```
+
+
+```{r}
+prep_c50 <- function(df){
+  # Date -> numeric (days since 1970)
+  date_cols <- sapply(df, inherits, what = "Date")
+  if (any(date_cols)) df[date_cols] <- lapply(df[date_cols], as.numeric)
+
+  # character -> factor (just in case any slipped through)
+  char_cols <- sapply(df, is.character)
+  if (any(char_cols)) df[char_cols] <- lapply(df[char_cols], as.factor)
+
+  df
+}
+
+train_c50 <- prep_c50(train_first_dt)
+test_c50  <- prep_c50(test_first_dt)
+
+# ensure consistent 2-level factor outcome
+train_c50$y <- droplevels(factor(train_c50$y))
+test_c50$y  <- factor(test_c50$y, levels = levels(train_c50$y))
+
+stopifnot(nlevels(train_c50$y) == 2)
+
+neg_lab <- levels(train_c50$y)[1]
+pos_lab <- levels(train_c50$y)[2]
+
+set.seed(12345)
+c50_model <- C50::C5.0(y ~ ., data = train_c50)
+
+# if the model produced no tree/rules, predict() will fail
+if (all(c50_model$size == 0)) {
+  stop("C5.0 produced tree size 0. Check class balance with table(train_first_dt$y) and predictors (some issue prevented splits).")
+}
+
+# Probabilities + class predictions (threshold 0.5)
+c50_prob <- predict(c50_model, newdata = test_c50, type = "prob")[, pos_lab]
+c50_pred <- factor(ifelse(c50_prob >= 0.5, pos_lab, neg_lab),
+                   levels = c(neg_lab, pos_lab))
+
+# Confusion matrix
+cm_c50 <- confusionMatrix(c50_pred, test_c50$y, positive = pos_lab)
+cm_c50
+
+# Profit
+c50_profit_total <- gain_function(cm_c50)
+c50_profit_per_booking <- c50_profit_total / nrow(test_c50)
+
+c50_profit_total
+c50_profit_per_booking
+
+```
+
+### Here we combine the five prediction vectors and the response variable into a Data Frame. We are using probabilities.
+```{r}
+# =========================
+# Step 6: Stack (probabilities) — NO ANN
+# Creates 5 probability vectors + y (6 columns)
+# =========================
+
+# 1) LR probability of cancel (=1)
+p_lr <- lr_prob_base
+
+# 2) KNN probability of class "1"
+knn_pred <- knn(train = train_first_knn_x,
+                test  = test_first_knn_x,
+                cl    = train_first_knn_y,
+                k     = best_k,          # change if you want a fixed k (e.g., 20)
+                prob  = TRUE)
+p_knn <- ifelse(knn_pred == "1", attr(knn_pred, "prob"), 1 - attr(knn_pred, "prob"))
+
+# 3) SVM probability of class "1"
+p_svm <- predict(svm_model_rbfdot, test_first_svm, type = "probabilities")[, 2]
+
+# 4) C5.0 probability of positive class
+pos_lab <- levels(test_c50$y)[2]
+p_c50 <- predict(c50_model, newdata = test_c50, type = "prob")[, pos_lab]
+
+# 5) Random Forest probability of class "1"
+
+# rf_model <- randomForest(y ~ ., data = train_first_rf)
+p_rf <- predict(rf_model, newdata = test_first_rf, type = "prob")[, 2]
+
+# Combine into 6-column stacked dataset (5 probs + response)
+stack_df <- data.frame(
+  p_lr  = as.numeric(p_lr),
+  p_knn = as.numeric(p_knn),
+  p_svm = as.numeric(p_svm),
+  p_c50 = as.numeric(p_c50),
+  p_rf  = as.numeric(p_rf),
+  y     = test_first_log$y
+)
+
+str(stack_df)
+head(stack_df)
+
+```
+###We will break the data frame into a 70/30 train/test split
+```{r}
+
+# Step 7: Split stacked data (70/30)
+
+set.seed(12345)
+
+idx <- sample(seq_len(nrow(stack_df)), size = floor(0.7 * nrow(stack_df)))
+
+stack_train <- stack_df[idx, ]
+stack_test  <- stack_df[-idx, ]
+
+# quick checks
+nrow(stack_train) / nrow(stack_df)
+table(stack_train$y)
+table(stack_test$y)
+
+```
+###Build the stacked model
+```{r}
+
+# Step 8: Meta (2nd-level) Decision Tree + plot
+
+library(C50)
+
+stack_train$y <- factor(stack_train$y, levels = c(0, 1))
+stack_test$y  <- factor(stack_test$y,  levels = c(0, 1))
+
+set.seed(12345)
+meta_tree <- C5.0(y ~ p_lr + p_knn + p_svm + p_c50 + p_rf, data = stack_train)
+
+plot(meta_tree)
+summary(meta_tree)
+
+```
+###Predict stacked model
+```{r}
+
+# Step 9: Predict on stacked test + confusion matrix
+
+
+meta_pred <- predict(meta_tree, newdata = stack_test, type = "class")
+
+cm_meta <- confusionMatrix(meta_pred, stack_test$y, positive = "1")
+cm_meta
+
+```
+###Build and predict stacked model with cost matrix added
+```{r}
+
+# Step 10: Cost-sensitive meta decision tree (C5.0 with cost matrix)
+# Financials FIRST
+
+
+# --- Financial assumptions 
+ADR            <- 100
+var_cost       <- 30
+profit_TN      <- ADR - var_cost          # 70
+profit_TP      <- 18.2                    # your expected TP value using p=0.37
+cost_FP        <- 140                     # walking cost / overbooking error severity
+cost_FN        <- 70                      # missed cancellation opportunity cost
+
+# Profit from a caret confusionMatrix (rows = predicted, cols = true)
+profit_from_cm <- function(cm){
+  TN <- cm$table[1,1]
+  FN <- cm$table[1,2]
+  FP <- cm$table[2,1]
+  TP <- cm$table[2,2]
+  profit_TN*TN + profit_TP*TP - cost_FP*FP - cost_FN*FN
+}
+
+# --- Ensure y is a 2-level factor: 0 = not canceled, 1 = canceled ---
+stack_train$y <- factor(stack_train$y, levels = c(0,1))
+stack_test$y  <- factor(stack_test$y,  levels = c(0,1))
+
+# --- Cost matrix for C5.0 ---
+# Rows = predicted class, Columns = true class
+# [pred=0, true=1] = FN cost, [pred=1, true=0] = FP cost
+cost_mat <- matrix(
+  c(0,      cost_FN,
+    cost_FP, 0),
+  nrow = 2, byrow = TRUE,
+  dimnames = list(pred = c("0","1"), true = c("0","1"))
+)
+
+# Train cost-sensitive meta tree
+set.seed(12345)
+meta_tree_cost <- C50::C5.0(
+  y ~ p_lr + p_knn + p_svm + p_c50 + p_rf,
+  data  = stack_train,
+  costs = cost_mat
+)
+
+plot(meta_tree_cost)
+
+# Predict + evaluate
+meta_pred_cost <- predict(meta_tree_cost, newdata = stack_test, type = "class")
+cm_meta_cost <- caret::confusionMatrix(meta_pred_cost, stack_test$y, positive = "1")
+cm_meta_cost
+
+# Profit
+meta_profit_total <- profit_from_cm(cm_meta_cost)
+meta_profit_per_booking <- meta_profit_total / nrow(stack_test)
+
+meta_profit_total
+meta_profit_per_booking
+
+```
+###Step 10: Compare all models on precision, accuracy, kappa, sensitivity, and normalized profit
+```{r}
+
+# Step 10: Compare models on THEIR OWN test sets
+# Base models -> evaluated on their original test sets
+# Stacked models -> evaluated on stack_test
+# Includes profit (raw) + profit per 100 bookings
+
+
+library(caret)
+library(class)
+library(kernlab)
+library(C50)
+library(randomForest)
+
+# ---- Financials (same as your profit function) ----
+ADR <- 100
+var_cost <- 30
+profit_TN <- ADR - var_cost   # 70
+profit_TP <- 18.2             # your expected TP value
+cost_FP   <- 140
+cost_FN   <- 70
+
+# ---- Helpers ----
+as01 <- function(y){
+  y_chr <- as.character(y)
+  factor(ifelse(y_chr %in% c("1","Yes","TRUE","T"), "1", "0"), levels = c("0","1"))
+}
+
+profit_from_cm <- function(cm){
+  tab <- cm$table
+  TN <- tab["0","0"]
+  FN <- tab["0","1"]
+  FP <- tab["1","0"]
+  TP <- tab["1","1"]
+  profit_TN*TN + profit_TP*TP - cost_FP*FP - cost_FN*FN
+}
+
+cm_from_prob <- function(p, y01, thr = 0.5){
+  pred <- factor(ifelse(p >= thr, "1", "0"), levels = c("0","1"))
+  confusionMatrix(pred, y01, positive = "1")
+}
+
+row_from_cm <- function(model_name, cm, eval_set){
+  n <- sum(cm$table)
+  prof_raw <- profit_from_cm(cm)
+  data.frame(
+    model       = model_name,
+    eval_set    = eval_set,
+    n_test      = n,
+    sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    precision   = as.numeric(cm$byClass["Pos Pred Value"]),
+    accuracy    = as.numeric(cm$overall["Accuracy"]),
+    kappa       = as.numeric(cm$overall["Kappa"]),
+    profit_raw  = as.numeric(prof_raw),
+    profit_per100 = as.numeric(prof_raw / n * 100),
+    stringsAsFactors = FALSE
+  )
+}
+
+results_compare <- data.frame()
+
+
+# BASE MODELS (original test sets)
+
+
+# 1) Logistic Regression (test_first_log)
+y_lr  <- as01(test_first_log$y)
+p_lr  <- predict(lr_model_base, newdata = test_first_log, type = "response")
+cm_lr <- cm_from_prob(p_lr, y_lr, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("Logistic Regression", cm_lr, "Base test (log)"))
+
+# 2) KNN (test_first_knn)  =
+y_knn <- as01(test_first_knn_y)
+knn_pred <- knn(train = train_first_knn_x, test = test_first_knn_x, cl = train_first_knn_y,
+                k = best_k, prob = TRUE)
+p_knn <- ifelse(knn_pred == "1", attr(knn_pred, "prob"), 1 - attr(knn_pred, "prob"))
+cm_knn <- cm_from_prob(p_knn, y_knn, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm(paste0("KNN (k=", best_k, ")"), cm_knn, "Base test (knn)"))
+
+# 3) SVM (test_first_svm) 
+y_svm <- as01(test_first_svm$y)
+p_svm <- predict(svm_model_rbfdot, test_first_svm, type = "probabilities")[, 2]
+cm_svm <- cm_from_prob(p_svm, y_svm, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("SVM (rbfdot)", cm_svm, "Base test (svm)"))
+
+# 4) C5.0 base tree 
+prep_c50 <- function(df){
+  date_cols <- sapply(df, inherits, what = "Date")
+  if (any(date_cols)) df[date_cols] <- lapply(df[date_cols], as.numeric)
+  char_cols <- sapply(df, is.character)
+  if (any(char_cols)) df[char_cols] <- lapply(df[char_cols], as.factor)
+  df
+}
+if (!exists("train_c50") || !exists("test_c50")) {
+  train_c50 <- prep_c50(train_first_dt)
+  test_c50  <- prep_c50(test_first_dt)
+}
+train_c50$y <- as01(train_c50$y)
+test_c50$y  <- as01(test_c50$y)
+
+c50_model_base <- C5.0(y ~ ., data = train_c50)
+p_c50 <- predict(c50_model_base, newdata = test_c50, type = "prob")[, "1"]
+cm_c50 <- cm_from_prob(p_c50, test_c50$y, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("C5.0 (base tree)", cm_c50, "Base test (c5.0)"))
+
+# 5) Random Forest (test_first_rf)
+train_rf <- train_first_rf; test_rf <- test_first_rf
+train_rf$y <- as01(train_rf$y)
+test_rf$y  <- as01(test_rf$y)
+
+rf_model_base <- randomForest(y ~ ., data = train_rf)
+p_rf <- predict(rf_model_base, newdata = test_rf, type = "prob")[, "1"]
+cm_rf <- cm_from_prob(p_rf, test_rf$y, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("Random Forest (base)", cm_rf, "Base test (rf)"))
+
+
+# STACKED MODELS (stack_test)
+
+y_stack <- as01(stack_test$y)
+
+# Meta tree (no costs) built in Step 8
+meta_pred <- predict(meta_tree, newdata = stack_test, type = "class")
+cm_meta <- confusionMatrix(factor(as.character(meta_pred), levels = c("0","1")),
+                           y_stack, positive = "1")
+results_compare <- rbind(results_compare, row_from_cm("Meta Tree (stacked)", cm_meta, "Stacked test"))
+
+# Cost-sensitive meta tree built in Step 10
+meta_pred_cost <- predict(meta_tree_cost, newdata = stack_test, type = "class")
+cm_meta_cost <- confusionMatrix(factor(as.character(meta_pred_cost), levels = c("0","1")),
+                                y_stack, positive = "1")
+results_compare <- rbind(results_compare, row_from_cm("Meta Tree (cost matrix)", cm_meta_cost, "Stacked test"))
+
+# Final table
+results_compare
+
+```
+
+```{r}
+# =========================
+# Simple Log-Odds Importance Chart (Logistic Regression)
+# (Top predictors by absolute coefficient size)
+# =========================
+library(ggplot2)
+
+# If lr_model_base doesn't exist yet, fit it
+if (!exists("lr_model_base")) {
+  lr_model_base <- glm(y ~ ., data = train_first_log, family = binomial)
+}
+
+TOP_N <- 20  # change to show more/less
+
+coef_df <- data.frame(
+  term = names(coef(lr_model_base)),
+  log_odds = as.numeric(coef(lr_model_base)),
+  stringsAsFactors = FALSE
+)
+
+coef_df <- subset(coef_df, term != "(Intercept)")
+coef_df$abs_log_odds <- abs(coef_df$log_odds)
+
+# keep top N
+coef_df <- coef_df[order(-coef_df$abs_log_odds), ]
+coef_df <- head(coef_df, TOP_N)
+
+# nicer ordering for plot
+coef_df$term <- factor(coef_df$term, levels = rev(coef_df$term))
+
+p <- ggplot(coef_df, aes(x = term, y = log_odds)) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  labs(
+    title = "Most Important Predictors (Log-Odds) — Logistic Regression",
+    subtitle = paste0("Top ", TOP_N, " coefficients by |log-odds| (β). Positive = higher cancellation odds"),
+    x = NULL,
+    y = "Log-odds coefficient (β)"
+  ) +
+  theme_minimal()
+
+print(p)
+
+```
+
+

@@ -1164,10 +1164,7 @@ ggplot() +
 
 #### Basic ANN
 
-```{r}
-model_ann_b <- neuralnet(y ~ ., data = train_first_ann)
-plot(model_ann_b)
-```
+
 
 ```{r}
 train_first_ann$y <- ifelse(train_first_ann$y == 1, 1, 0)
@@ -1192,11 +1189,6 @@ summary(test_first_log$reserved_room_type)
 ```{r}
 table(train_first_dt$y)
 
-```
-
-```{r}
-model_ann_b <- neuralnet(y ~ ., data = train_first_ann)
-plot(model_ann_b)
 ```
 
 ### SVM
@@ -1480,4 +1472,359 @@ ggplot() +
   )
 
 ```
+###Random forrest
+```{r}
+# Random Forest (train + prob of class "1")
+rf_model <- randomForest(y ~ ., data = train_first_rf)
+p_rf <- predict(rf_model, newdata = test_first_rf, type = "prob")[, 2]
+
+```
+
+```{r}
+
+# =========================
+# C5.0 Decision Tree (basic)
+# =========================
+
+prep_c50 <- function(df){
+  # Date -> numeric (days since 1970)
+  date_cols <- sapply(df, inherits, what = "Date")
+  if (any(date_cols)) df[date_cols] <- lapply(df[date_cols], as.numeric)
+
+  # character -> factor (just in case any slipped through)
+  char_cols <- sapply(df, is.character)
+  if (any(char_cols)) df[char_cols] <- lapply(df[char_cols], as.factor)
+
+  df
+}
+
+train_c50 <- prep_c50(train_first_dt)
+test_c50  <- prep_c50(test_first_dt)
+
+# ensure consistent 2-level factor outcome
+train_c50$y <- droplevels(factor(train_c50$y))
+test_c50$y  <- factor(test_c50$y, levels = levels(train_c50$y))
+
+stopifnot(nlevels(train_c50$y) == 2)
+
+neg_lab <- levels(train_c50$y)[1]
+pos_lab <- levels(train_c50$y)[2]
+
+set.seed(12345)
+c50_model <- C50::C5.0(y ~ ., data = train_c50)
+
+# if the model produced no tree/rules, predict() will fail
+if (all(c50_model$size == 0)) {
+  stop("C5.0 produced tree size 0. Check class balance with table(train_first_dt$y) and predictors (some issue prevented splits).")
+}
+
+# Probabilities + class predictions (threshold 0.5)
+c50_prob <- predict(c50_model, newdata = test_c50, type = "prob")[, pos_lab]
+c50_pred <- factor(ifelse(c50_prob >= 0.5, pos_lab, neg_lab),
+                   levels = c(neg_lab, pos_lab))
+
+# Confusion matrix
+cm_c50 <- confusionMatrix(c50_pred, test_c50$y, positive = pos_lab)
+cm_c50
+
+# Profit
+c50_profit_total <- gain_function(cm_c50)
+c50_profit_per_booking <- c50_profit_total / nrow(test_c50)
+
+c50_profit_total
+c50_profit_per_booking
+
+```
+
+### 6. Here we combine the five prediction vectors and the response variable into a Data Frame. We are using probabilities.
+```{r}
+# =========================
+# Step 6: Stack (probabilities) — NO ANN
+# Creates 5 probability vectors + y (6 columns)
+# =========================
+
+# 1) LR probability of cancel (=1)
+p_lr <- lr_prob_base
+
+# 2) KNN probability of class "1"
+knn_pred <- knn(train = train_first_knn_x,
+                test  = test_first_knn_x,
+                cl    = train_first_knn_y,
+                k     = best_k,          # change if you want a fixed k (e.g., 20)
+                prob  = TRUE)
+p_knn <- ifelse(knn_pred == "1", attr(knn_pred, "prob"), 1 - attr(knn_pred, "prob"))
+
+# 3) SVM probability of class "1"
+p_svm <- predict(svm_model_rbfdot, test_first_svm, type = "probabilities")[, 2]
+
+# 4) C5.0 probability of positive class
+pos_lab <- levels(test_c50$y)[2]
+p_c50 <- predict(c50_model, newdata = test_c50, type = "prob")[, pos_lab]
+
+# 5) Random Forest probability of class "1"
+
+# rf_model <- randomForest(y ~ ., data = train_first_rf)
+p_rf <- predict(rf_model, newdata = test_first_rf, type = "prob")[, 2]
+
+# Combine into 6-column stacked dataset (5 probs + response)
+stack_df <- data.frame(
+  p_lr  = as.numeric(p_lr),
+  p_knn = as.numeric(p_knn),
+  p_svm = as.numeric(p_svm),
+  p_c50 = as.numeric(p_c50),
+  p_rf  = as.numeric(p_rf),
+  y     = test_first_log$y
+)
+
+str(stack_df)
+head(stack_df)
+
+```
+###We will break the data frame into a 70/30 train/test split
+```{r}
+
+# Step 7: Split stacked data (70/30)
+
+set.seed(12345)
+
+idx <- sample(seq_len(nrow(stack_df)), size = floor(0.7 * nrow(stack_df)))
+
+stack_train <- stack_df[idx, ]
+stack_test  <- stack_df[-idx, ]
+
+# quick checks
+nrow(stack_train) / nrow(stack_df)
+table(stack_train$y)
+table(stack_test$y)
+
+```
+###Build the stacked model
+```{r}
+
+# Step 8: Meta (2nd-level) Decision Tree + plot
+
+library(C50)
+
+stack_train$y <- factor(stack_train$y, levels = c(0, 1))
+stack_test$y  <- factor(stack_test$y,  levels = c(0, 1))
+
+set.seed(12345)
+meta_tree <- C5.0(y ~ p_lr + p_knn + p_svm + p_c50 + p_rf, data = stack_train)
+
+plot(meta_tree)
+summary(meta_tree)
+
+```
+###Predict stacked model
+```{r}
+
+# Step 9: Predict on stacked test + confusion matrix
+
+
+meta_pred <- predict(meta_tree, newdata = stack_test, type = "class")
+
+cm_meta <- confusionMatrix(meta_pred, stack_test$y, positive = "1")
+cm_meta
+
+```
+###Build and predict stacked model with cost matrix added
+```{r}
+
+# Step 10: Cost-sensitive meta decision tree (C5.0 with cost matrix)
+# Financials FIRST
+
+
+# --- Financial assumptions 
+ADR            <- 100
+var_cost       <- 30
+profit_TN      <- ADR - var_cost          # 70
+profit_TP      <- 18.2                    # your expected TP value using p=0.37
+cost_FP        <- 140                     # walking cost / overbooking error severity
+cost_FN        <- 70                      # missed cancellation opportunity cost
+
+# Profit from a caret confusionMatrix (rows = predicted, cols = true)
+profit_from_cm <- function(cm){
+  TN <- cm$table[1,1]
+  FN <- cm$table[1,2]
+  FP <- cm$table[2,1]
+  TP <- cm$table[2,2]
+  profit_TN*TN + profit_TP*TP - cost_FP*FP - cost_FN*FN
+}
+
+# --- Ensure y is a 2-level factor: 0 = not canceled, 1 = canceled ---
+stack_train$y <- factor(stack_train$y, levels = c(0,1))
+stack_test$y  <- factor(stack_test$y,  levels = c(0,1))
+
+# --- Cost matrix for C5.0 ---
+# Rows = predicted class, Columns = true class
+# [pred=0, true=1] = FN cost, [pred=1, true=0] = FP cost
+cost_mat <- matrix(
+  c(0,      cost_FN,
+    cost_FP, 0),
+  nrow = 2, byrow = TRUE,
+  dimnames = list(pred = c("0","1"), true = c("0","1"))
+)
+
+# Train cost-sensitive meta tree
+set.seed(12345)
+meta_tree_cost <- C50::C5.0(
+  y ~ p_lr + p_knn + p_svm + p_c50 + p_rf,
+  data  = stack_train,
+  costs = cost_mat
+)
+
+plot(meta_tree_cost)
+
+# Predict + evaluate
+meta_pred_cost <- predict(meta_tree_cost, newdata = stack_test, type = "class")
+cm_meta_cost <- caret::confusionMatrix(meta_pred_cost, stack_test$y, positive = "1")
+cm_meta_cost
+
+# Profit
+meta_profit_total <- profit_from_cm(cm_meta_cost)
+meta_profit_per_booking <- meta_profit_total / nrow(stack_test)
+
+meta_profit_total
+meta_profit_per_booking
+
+```
+###Step 10: Compare all models on precision, accuracy, kappa, sensitivity, and normalized profit
+```{r}
+
+# Step 10: Compare models on THEIR OWN test sets
+# Base models -> evaluated on their original test sets
+# Stacked models -> evaluated on stack_test
+# Includes profit (raw) + profit per 100 bookings
+
+
+library(caret)
+library(class)
+library(kernlab)
+library(C50)
+library(randomForest)
+
+# ---- Financials (same as your profit function) ----
+ADR <- 100
+var_cost <- 30
+profit_TN <- ADR - var_cost   # 70
+profit_TP <- 18.2             # your expected TP value
+cost_FP   <- 140
+cost_FN   <- 70
+
+# ---- Helpers ----
+as01 <- function(y){
+  y_chr <- as.character(y)
+  factor(ifelse(y_chr %in% c("1","Yes","TRUE","T"), "1", "0"), levels = c("0","1"))
+}
+
+profit_from_cm <- function(cm){
+  tab <- cm$table
+  TN <- tab["0","0"]
+  FN <- tab["0","1"]
+  FP <- tab["1","0"]
+  TP <- tab["1","1"]
+  profit_TN*TN + profit_TP*TP - cost_FP*FP - cost_FN*FN
+}
+
+cm_from_prob <- function(p, y01, thr = 0.5){
+  pred <- factor(ifelse(p >= thr, "1", "0"), levels = c("0","1"))
+  confusionMatrix(pred, y01, positive = "1")
+}
+
+row_from_cm <- function(model_name, cm, eval_set){
+  n <- sum(cm$table)
+  prof_raw <- profit_from_cm(cm)
+  data.frame(
+    model       = model_name,
+    eval_set    = eval_set,
+    n_test      = n,
+    sensitivity = as.numeric(cm$byClass["Sensitivity"]),
+    precision   = as.numeric(cm$byClass["Pos Pred Value"]),
+    accuracy    = as.numeric(cm$overall["Accuracy"]),
+    kappa       = as.numeric(cm$overall["Kappa"]),
+    profit_raw  = as.numeric(prof_raw),
+    profit_per100 = as.numeric(prof_raw / n * 100),
+    stringsAsFactors = FALSE
+  )
+}
+
+results_compare <- data.frame()
+
+# =========================
+# BASE MODELS (original test sets)
+# =========================
+
+# 1) Logistic Regression (test_first_log)
+y_lr  <- as01(test_first_log$y)
+p_lr  <- predict(lr_model_base, newdata = test_first_log, type = "response")
+cm_lr <- cm_from_prob(p_lr, y_lr, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("Logistic Regression", cm_lr, "Base test (log)"))
+
+# 2) KNN (test_first_knn)  -- uses best_k that you already found
+y_knn <- as01(test_first_knn_y)
+knn_pred <- knn(train = train_first_knn_x, test = test_first_knn_x, cl = train_first_knn_y,
+                k = best_k, prob = TRUE)
+p_knn <- ifelse(knn_pred == "1", attr(knn_pred, "prob"), 1 - attr(knn_pred, "prob"))
+cm_knn <- cm_from_prob(p_knn, y_knn, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm(paste0("KNN (k=", best_k, ")"), cm_knn, "Base test (knn)"))
+
+# 3) SVM (test_first_svm) -- rbfdot model you trained earlier
+y_svm <- as01(test_first_svm$y)
+p_svm <- predict(svm_model_rbfdot, test_first_svm, type = "probabilities")[, 2]
+cm_svm <- cm_from_prob(p_svm, y_svm, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("SVM (rbfdot)", cm_svm, "Base test (svm)"))
+
+# 4) C5.0 base tree (uses your prepared test_c50 if it exists; otherwise rebuild quickly)
+prep_c50 <- function(df){
+  date_cols <- sapply(df, inherits, what = "Date")
+  if (any(date_cols)) df[date_cols] <- lapply(df[date_cols], as.numeric)
+  char_cols <- sapply(df, is.character)
+  if (any(char_cols)) df[char_cols] <- lapply(df[char_cols], as.factor)
+  df
+}
+if (!exists("train_c50") || !exists("test_c50")) {
+  train_c50 <- prep_c50(train_first_dt)
+  test_c50  <- prep_c50(test_first_dt)
+}
+train_c50$y <- as01(train_c50$y)
+test_c50$y  <- as01(test_c50$y)
+
+c50_model_base <- C5.0(y ~ ., data = train_c50)
+p_c50 <- predict(c50_model_base, newdata = test_c50, type = "prob")[, "1"]
+cm_c50 <- cm_from_prob(p_c50, test_c50$y, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("C5.0 (base tree)", cm_c50, "Base test (c5.0)"))
+
+# 5) Random Forest (test_first_rf)
+train_rf <- train_first_rf; test_rf <- test_first_rf
+train_rf$y <- as01(train_rf$y)
+test_rf$y  <- as01(test_rf$y)
+
+rf_model_base <- randomForest(y ~ ., data = train_rf)
+p_rf <- predict(rf_model_base, newdata = test_rf, type = "prob")[, "1"]
+cm_rf <- cm_from_prob(p_rf, test_rf$y, thr = 0.5)
+results_compare <- rbind(results_compare, row_from_cm("Random Forest (base)", cm_rf, "Base test (rf)"))
+
+# =========================
+# STACKED MODELS (stack_test)
+# =========================
+y_stack <- as01(stack_test$y)
+
+# Meta tree (no costs) built in Step 8
+meta_pred <- predict(meta_tree, newdata = stack_test, type = "class")
+cm_meta <- confusionMatrix(factor(as.character(meta_pred), levels = c("0","1")),
+                           y_stack, positive = "1")
+results_compare <- rbind(results_compare, row_from_cm("Meta Tree (stacked)", cm_meta, "Stacked test"))
+
+# Cost-sensitive meta tree built in Step 10
+meta_pred_cost <- predict(meta_tree_cost, newdata = stack_test, type = "class")
+cm_meta_cost <- confusionMatrix(factor(as.character(meta_pred_cost), levels = c("0","1")),
+                                y_stack, positive = "1")
+results_compare <- rbind(results_compare, row_from_cm("Meta Tree (cost matrix)", cm_meta_cost, "Stacked test"))
+
+# Final table
+results_compare
+
+```
+
+
 

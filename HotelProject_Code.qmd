@@ -785,39 +785,7 @@ ggplot() +
 ```
 
 
-```{r}
-lr_model_base <- glm(y ~ ., data = train_first_log, family = binomial)
-#lr_model_advanced <- glm(y ~ . + studytime:freetime + goout:freetime + studytime:goout, data = train_first_log, family = binomial)
-lr_model_step <- step(glm(y ~ ., data = train_first_log, family = binomial), trace = 0)
 
-## new line to avoid error added by marina: 
-lr_results_1 <- data.frame()
-
-thresholds <- seq(0, 1, by = 0.5)
-for (A in c("base", "step")) {
-  for (t in thresholds) {
-    assign(paste0("lr_prob_", A), predict(get(paste0("lr_model_", A)), newdata = test_first_log, type = "response"))
-    assign(paste0("lr_pred_", A), ifelse(get(paste0("lr_prob_", A)) >= t, "1", "0"))
-    assign(paste0("lr_cm_", A), confusionMatrix(as.factor(get(paste0("lr_pred_", A))), as.factor(test_first_log$y), positive = "1"))
-    cm <- confusionMatrix(as.factor(get(paste0("lr_pred_", A))), as.factor(test_first_log$y), positive = "1")
-    assign(paste0("lr_gain_", A), gain_function(cm))
-    assign(paste0("lr_kappa_", A), as.numeric(cm$overall["Kappa"]))
-    assign(paste0("lr_accuracy_", A), as.numeric(cm$overall["Accuracy"]))
-    assign(paste0("lr_sensitivity_", A), as.numeric(cm$byClass["Sensitivity"]))
-    assign(paste0("lr_specificity_", A), as.numeric(cm$byClass["Specificity"]))
-    lr_results_1 <- rbind(lr_results_1, data.frame(model = A, threshold = t,
-                                                   kappa = get(paste0("lr_kappa_", A)),
-                                                   gain = get(paste0("lr_gain_", A)),
-                                                   accuracy = get(paste0("lr_accuracy_", A)),
-                                                   sensitivity = get(paste0("lr_sensitivity_", A)),
-                                                   specificity = get(paste0("lr_specificity_", A)),
-                                                   stringsAsFactors = FALSE, row.names = NULL))
-  }
-  assign(paste0("lr_standard_", A), head(lr_results_1[lr_results_1$model == A & lr_results_1$threshold == 0.5, ], 1))
-  assign(paste0("lr_maxgain_", A), lr_results_1[lr_results_1$model == A, ][which.max(lr_results_1$gain[lr_results_1$model == A]), ])
-  assign(paste0("lr_maxkappa_", A), lr_results_1[lr_results_1$model == A, ][which.max(lr_results_1$kappa[lr_results_1$model == A]), ])
-}
-```
 
 ### KNN
 
@@ -1472,7 +1440,7 @@ ggplot() +
   )
 
 ```
-###Random forrest
+###Random forest
 ```{r}
 # Random Forest (train + prob of class "1")
 rf_model <- randomForest(y ~ ., data = train_first_rf)
@@ -1482,9 +1450,9 @@ p_rf <- predict(rf_model, newdata = test_first_rf, type = "prob")[, 2]
 
 ```{r}
 
-# =========================
-# C5.0 Decision Tree (basic)
-# =========================
+
+# C5.0 Decision Tree 
+
 
 prep_c50 <- function(df){
   # Date -> numeric (days since 1970)
@@ -1750,9 +1718,9 @@ row_from_cm <- function(model_name, cm, eval_set){
 
 results_compare <- data.frame()
 
-# =========================
+
 # BASE MODELS (original test sets)
-# =========================
+
 
 # 1) Logistic Regression (test_first_log)
 y_lr  <- as01(test_first_log$y)
@@ -1760,7 +1728,7 @@ p_lr  <- predict(lr_model_base, newdata = test_first_log, type = "response")
 cm_lr <- cm_from_prob(p_lr, y_lr, thr = 0.5)
 results_compare <- rbind(results_compare, row_from_cm("Logistic Regression", cm_lr, "Base test (log)"))
 
-# 2) KNN (test_first_knn)  -- uses best_k that you already found
+# 2) KNN (test_first_knn)  =
 y_knn <- as01(test_first_knn_y)
 knn_pred <- knn(train = train_first_knn_x, test = test_first_knn_x, cl = train_first_knn_y,
                 k = best_k, prob = TRUE)
@@ -1768,13 +1736,13 @@ p_knn <- ifelse(knn_pred == "1", attr(knn_pred, "prob"), 1 - attr(knn_pred, "pro
 cm_knn <- cm_from_prob(p_knn, y_knn, thr = 0.5)
 results_compare <- rbind(results_compare, row_from_cm(paste0("KNN (k=", best_k, ")"), cm_knn, "Base test (knn)"))
 
-# 3) SVM (test_first_svm) -- rbfdot model you trained earlier
+# 3) SVM (test_first_svm) 
 y_svm <- as01(test_first_svm$y)
 p_svm <- predict(svm_model_rbfdot, test_first_svm, type = "probabilities")[, 2]
 cm_svm <- cm_from_prob(p_svm, y_svm, thr = 0.5)
 results_compare <- rbind(results_compare, row_from_cm("SVM (rbfdot)", cm_svm, "Base test (svm)"))
 
-# 4) C5.0 base tree (uses your prepared test_c50 if it exists; otherwise rebuild quickly)
+# 4) C5.0 base tree 
 prep_c50 <- function(df){
   date_cols <- sapply(df, inherits, what = "Date")
   if (any(date_cols)) df[date_cols] <- lapply(df[date_cols], as.numeric)
@@ -1804,9 +1772,9 @@ p_rf <- predict(rf_model_base, newdata = test_rf, type = "prob")[, "1"]
 cm_rf <- cm_from_prob(p_rf, test_rf$y, thr = 0.5)
 results_compare <- rbind(results_compare, row_from_cm("Random Forest (base)", cm_rf, "Base test (rf)"))
 
-# =========================
+
 # STACKED MODELS (stack_test)
-# =========================
+
 y_stack <- as01(stack_test$y)
 
 # Meta tree (no costs) built in Step 8
@@ -1826,5 +1794,50 @@ results_compare
 
 ```
 
+```{r}
+# =========================
+# Simple Log-Odds Importance Chart (Logistic Regression)
+# (Top predictors by absolute coefficient size)
+# =========================
+library(ggplot2)
+
+# If lr_model_base doesn't exist yet, fit it
+if (!exists("lr_model_base")) {
+  lr_model_base <- glm(y ~ ., data = train_first_log, family = binomial)
+}
+
+TOP_N <- 20  # change to show more/less
+
+coef_df <- data.frame(
+  term = names(coef(lr_model_base)),
+  log_odds = as.numeric(coef(lr_model_base)),
+  stringsAsFactors = FALSE
+)
+
+coef_df <- subset(coef_df, term != "(Intercept)")
+coef_df$abs_log_odds <- abs(coef_df$log_odds)
+
+# keep top N
+coef_df <- coef_df[order(-coef_df$abs_log_odds), ]
+coef_df <- head(coef_df, TOP_N)
+
+# nicer ordering for plot
+coef_df$term <- factor(coef_df$term, levels = rev(coef_df$term))
+
+p <- ggplot(coef_df, aes(x = term, y = log_odds)) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  labs(
+    title = "Most Important Predictors (Log-Odds) — Logistic Regression",
+    subtitle = paste0("Top ", TOP_N, " coefficients by |log-odds| (β). Positive = higher cancellation odds"),
+    x = NULL,
+    y = "Log-odds coefficient (β)"
+  ) +
+  theme_minimal()
+
+print(p)
+
+```
 
 

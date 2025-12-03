@@ -621,7 +621,7 @@ lr_prob_base <- predict(
 
 ```
 
-Now we can create a confusion matrix, using a standard threshold of 0.5
+Now we can create a confusion matrix, using a threshold of .999...
 ```{r}
 # Confusion Matrix
 lr_pred_base <- ifelse(lr_prob_base >= 0.99999999, 1, 0)
@@ -914,7 +914,6 @@ ggplot() +
 
 ```
 
-
 Interpretation: 
 The basic KNN model performs much worse than logistic regression. Its accuracy is 77.9%, and the Kappa score (0.515) shows only moderate agreement with the true labels. KNN especially struggles to detect cancellations: sensitivity is 0.651, so it misses about one-third of all real cancellations.
 Specificity is higher (0.854), meaning it is better at identifying non-cancellations than cancellations, which a problem for overbooking decisions, where missed cancellations are costly. This weakness shows up in the profit metric as well: KNN produces only ~20.08 units of profit, less than half of logistic regression.
@@ -1159,17 +1158,83 @@ ggplot() +
 
 
 ```
+Interpretation: The KNN family shows a consistent pattern. All versions of KNN perform worse than logistic regression, but the tuned variants provide small improvements over the basic model.
+
+The basic KNN model reaches an accuracy of about 77.9 percent and a Kappa value of 0.515, which indicates only moderate agreement with true labels. Its sensitivity is 0.651, meaning it fails to detect roughly one third of all real cancellations. Specificity is higher at 0.854, so it identifies non cancellations more accurately than cancellations. Because missed cancellations create substantial opportunity costs, this imbalance significantly reduces economic value. The profit per booking for the basic KNN model is only about 20.08, which is much lower than logistic regression.
+
+The tuned KNN model optimized for Kappa performs better but still falls well short of logistic regression. Raising the neighborhood size smooths predictions and increases the Kappa score, improving the model’s consistency in distinguishing cancellations from non cancellations. Accuracy typically improves slightly, and sensitivity becomes stronger than in the basic model. Specificity generally remains high. However, the overall economic value remains limited because KNN cannot fully capture the complex patterns driving hotel cancellation behavior.
+
+The tuned KNN model optimized for profit achieves the highest profitability among the KNN variants. Tuning for profit pushes the model toward higher specificity, which reduces false positives that are very costly for the hotel. As a result, profit increases slightly compared to the other KNN versions. Even so, its profit remains far below the profit of logistic regression.
+
+Overall, all KNN models face the same structural limitations. The basic model performs the worst, the Kappa optimized model improves accuracy and balance somewhat, and the profit optimized model offers the best financial performance within the KNN group. Despite these improvements, every KNN model is significantly outperformed by logistic regression, which remains far more accurate, more balanced across sensitivity and specificity, and far more profitable for hotel decision making.
 
 ### ANN
 
 #### Basic ANN
-
-
-
 ```{r}
-train_first_ann$y <- ifelse(train_first_ann$y == 1, 1, 0)
+### ANN
+
+library(neuralnet)
+
+# make sure y is numeric 0 or 1 in both sets
+train_first_ann$y <- as.numeric(train_first_ann$y)
+test_first_ann$y  <- as.numeric(test_first_ann$y)
+
+# build formula y ~ all other columns
+ann_formula <- as.formula(
+  paste(
+    "y ~",
+    paste(setdiff(colnames(train_first_ann), "y"), collapse = " + ")
+  )
+)
+
+set.seed(12345)
+ann_model_base <- neuralnet(
+  ann_formula,
+  data          = train_first_ann,
+  hidden        = c(5, 5),   # two hidden layers with 5 nodes each
+  linear.output = FALSE      # logistic output for classification
+)
+
+# optional network plot
+plot(ann_model_base)
+
+# predictions on test set
+ann_pred_raw <- compute(
+  ann_model_base,
+  test_first_ann[, setdiff(colnames(test_first_ann), "y")]
+)$net.result
+
+ann_prob <- as.vector(ann_pred_raw)
+ann_pred <- ifelse(ann_prob >= 0.5, 1, 0)
+
+# confusion matrix
+ann_cm <- confusionMatrix(
+  as.factor(ann_pred),
+  as.factor(test_first_ann$y),
+  positive = "1"
+)
+
+ann_cm
+
 
 ```
+
+```{r}
+ann_row <- data.frame(
+  model       = "ANN base",
+  accuracy    = ann_cm$overall["Accuracy"],
+  kappa       = ann_cm$overall["Kappa"],
+  sensitivity = ann_cm$byClass["Sensitivity"],
+  specificity = ann_cm$byClass["Specificity"],
+  profit      = gain_function(ann_cm) / sum(ann_cm$table),
+  row.names   = NULL
+)
+
+summary_table <- rbind(summary_table, ann_row)
+
+```
+
 
 
 
@@ -1178,6 +1243,9 @@ train_first_dt$y <- factor(train_first_dt$y, labels = c("No", "Yes"))
 test_first_dt$y  <- factor(test_first_dt$y,  labels = c("No", "Yes"))
 str(train_first_dt)
 ```
+
+
+
 
 ```{r}
 summary(data$reserved_room_type)
@@ -1191,8 +1259,8 @@ table(train_first_dt$y)
 
 ```
 
-### SVM
 
+### SVM
 Train the SVM models:
 ```{r}
 for (k in c("rbfdot","polydot","vanilladot"))
@@ -1238,20 +1306,13 @@ svm_maxgain <- max(svm_results$gain)
 ```{r}
 svm_maxgain_rbfdot_table <- data.frame(
   model       = "SVM rbfdot max profit",
-  accuracy    = svm_maxgain_rbfdot["accuracy"],
-  kappa       = svm_maxgain_rbfdot["kappa"],
-  sensitivity = svm_maxgain_rbfdot["sensitivity"],
-  specificity = svm_maxgain_rbfdot["specificity"],
-  profit = svm_maxgain_rbfdot["gain"]/nrow(test_first_svm)
+  accuracy    = svm_maxgain_rbfdot$accuracy,
+  kappa       = svm_maxgain_rbfdot$kappa,
+  sensitivity = svm_maxgain_rbfdot$sensitivity,
+  specificity = svm_maxgain_rbfdot$specificity,
+  profit      = svm_maxgain_rbfdot$gain / nrow(test_first_svm)
 )
 
-svm_maxgain_rbfdot_table$profit <- svm_maxgain_rbfdot_table$gain
-
-svm_maxgain_rbfdot_table <- svm_maxgain_rbfdot_table %>%
-  select(-gain)
-
-
-# An bestehende summary_table anhängen
 summary_table <- rbind(summary_table, svm_maxgain_rbfdot_table)
 
 summary_long <- summary_table %>%
@@ -1264,17 +1325,14 @@ summary_long <- summary_table %>%
     metric = factor(metric,
                     levels = c("accuracy", "kappa",
                                "sensitivity", "specificity",
-                               "profit")),         # profit ganz rechts
+                               "profit")),
     model  = factor(model, levels = rev(unique(model)))
   )
 
-# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
 df_metrics <- dplyr::filter(summary_long, metric != "profit")
 df_profit  <- dplyr::filter(summary_long, metric == "profit")
 
-# 3) Heatmap mit zwei Farbskalen
 ggplot() +
-  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
   geom_tile(data = df_metrics,
             aes(x = metric, y = model, fill = value),
             colour = "white") +
@@ -1286,10 +1344,7 @@ ggplot() +
     low  = "#D8E6F3",
     high = "#084594"
   ) +
-
-  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
-
-  # Grüne Kachel für Profit
+  ggnewscale::new_scale_fill() +
   geom_tile(data = df_profit,
             aes(x = metric, y = model, fill = value),
             colour = "white") +
@@ -1301,7 +1356,6 @@ ggplot() +
     low  = "#e5f5e0",
     high = "#238b45"
   ) +
-
   labs(
     title = "Model Performance Comparison",
     x     = "Metric",
@@ -1318,20 +1372,13 @@ ggplot() +
 ```{r}
 svm_maxgain_polydot_table <- data.frame(
   model       = "SVM polydot max profit",
-  accuracy    = svm_maxgain_polydot["accuracy"],
-  kappa       = svm_maxgain_polydot["kappa"],
-  sensitivity = svm_maxgain_polydot["sensitivity"],
-  specificity = svm_maxgain_polydot["specificity"],
-  profit = svm_maxgain_polydot["gain"]/nrow(test_first_svm)
+  accuracy    = svm_maxgain_polydot$accuracy,
+  kappa       = svm_maxgain_polydot$kappa,
+  sensitivity = svm_maxgain_polydot$sensitivity,
+  specificity = svm_maxgain_polydot$specificity,
+  profit      = svm_maxgain_polydot$gain / nrow(test_first_svm)
 )
 
-svm_maxgain_polydot_table$profit <- svm_maxgain_polydot_table$gain
-
-svm_maxgain_polydot_table <- svm_maxgain_polydot_table %>%
-  select(-gain)
-
-
-# An bestehende summary_table anhängen
 summary_table <- rbind(summary_table, svm_maxgain_polydot_table)
 
 summary_long <- summary_table %>%
@@ -1344,17 +1391,14 @@ summary_long <- summary_table %>%
     metric = factor(metric,
                     levels = c("accuracy", "kappa",
                                "sensitivity", "specificity",
-                               "profit")),         # profit ganz rechts
+                               "profit")),
     model  = factor(model, levels = rev(unique(model)))
   )
 
-# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
 df_metrics <- dplyr::filter(summary_long, metric != "profit")
 df_profit  <- dplyr::filter(summary_long, metric == "profit")
 
-# 3) Heatmap mit zwei Farbskalen
 ggplot() +
-  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
   geom_tile(data = df_metrics,
             aes(x = metric, y = model, fill = value),
             colour = "white") +
@@ -1366,10 +1410,7 @@ ggplot() +
     low  = "#D8E6F3",
     high = "#084594"
   ) +
-
-  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
-
-  # Grüne Kachel für Profit
+  ggnewscale::new_scale_fill() +
   geom_tile(data = df_profit,
             aes(x = metric, y = model, fill = value),
             colour = "white") +
@@ -1381,7 +1422,6 @@ ggplot() +
     low  = "#e5f5e0",
     high = "#238b45"
   ) +
-
   labs(
     title = "Model Performance Comparison",
     x     = "Metric",
@@ -1397,20 +1437,13 @@ ggplot() +
 ```{r}
 svm_maxgain_vanilladot_table <- data.frame(
   model       = "SVM vanilladot max profit",
-  accuracy    = svm_maxgain_vanilladot["accuracy"],
-  kappa       = svm_maxgain_vanilladot["kappa"],
-  sensitivity = svm_maxgain_vanilladot["sensitivity"],
-  specificity = svm_maxgain_vanilladot["specificity"],
-  profit = svm_maxgain_vanilladot["gain"]/nrow(test_first_svm)
+  accuracy    = svm_maxgain_vanilladot$accuracy,
+  kappa       = svm_maxgain_vanilladot$kappa,
+  sensitivity = svm_maxgain_vanilladot$sensitivity,
+  specificity = svm_maxgain_vanilladot$specificity,
+  profit      = svm_maxgain_vanilladot$gain / nrow(test_first_svm)
 )
 
-svm_maxgain_vanilladot_table$profit <- svm_maxgain_vanilladot_table$gain
-
-svm_maxgain_vanilladot_table <- svm_maxgain_vanilladot_table %>%
-  select(-gain)
-
-
-# An bestehende summary_table anhängen
 summary_table <- rbind(summary_table, svm_maxgain_vanilladot_table)
 
 summary_long <- summary_table %>%
@@ -1423,17 +1456,14 @@ summary_long <- summary_table %>%
     metric = factor(metric,
                     levels = c("accuracy", "kappa",
                                "sensitivity", "specificity",
-                               "profit")),         # profit ganz rechts
+                               "profit")),
     model  = factor(model, levels = rev(unique(model)))
   )
 
-# 2) Aufteilen in „blaue Metriken“ und „grünen Profit“
 df_metrics <- dplyr::filter(summary_long, metric != "profit")
 df_profit  <- dplyr::filter(summary_long, metric == "profit")
 
-# 3) Heatmap mit zwei Farbskalen
 ggplot() +
-  # Blaue Kacheln für Accuracy/Kappa/Sens/Spec
   geom_tile(data = df_metrics,
             aes(x = metric, y = model, fill = value),
             colour = "white") +
@@ -1445,16 +1475,132 @@ ggplot() +
     low  = "#D8E6F3",
     high = "#084594"
   ) +
-
-  ggnewscale::new_scale_fill() +   # neue Fill-Skala starten
-
-  # Grüne Kachel für Profit
+  ggnewscale::new_scale_fill() +
   geom_tile(data = df_profit,
             aes(x = metric, y = model, fill = value),
             colour = "white") +
   geom_text(data = df_profit,
             aes(x = metric, y = model, label = round(value, 3)),
             color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+The three SVM models show clear differences in performance, with two of them nearly matching logistic regression and one performing closer to the middle tier. The SVM model with an rbfdot kernel is the weakest of the group, although still noticeably stronger than any of the KNN models. It reaches 0.857 accuracy with a Kappa score of 0.672. Its specificity is very strong at 0.973, but sensitivity is only 0.659, meaning it correctly identifies about two thirds of actual cancellations. As a result, its profit of 36.097 is higher than every KNN version but far below the best models such as logistic regression.
+
+In contrast, both the polydot and the vanilladot SVM models perform extremely well and almost match logistic regression. Each achieves 0.990 accuracy and a Kappa score of 0.979. Sensitivity and specificity are nearly perfect at 0.979 and 0.997, showing that these models capture cancellations and non cancellations with exceptional precision. The resulting profit is 49.694 for both kernels, very close to the logistic regression profit of 50.455 and far above KNN and the rbfdot SVM. These two SVMs also show more balanced detection of cancellations than the rbfdot version, which makes them much more suitable for revenue management decisions where missed cancellations are costly.
+
+Overall, the SVM models with polydot and vanilladot kernels stand out as top tier performers. They nearly replicate the strength of logistic regression across all metrics and provide extremely high profitability. The rbfdot model, although not as strong, still performs above all KNN variants and offers a meaningful improvement in both detection and profit. Together, the SVM results show that nonlinear decision boundaries can be very effective for this problem, but the choice of kernel is critical for achieving near optimal performance.
+ 
+### Random forrest
+
+```{r}
+### RANDOM FOREST aligned with business objective
+
+set.seed(12345)
+
+rf_model <- randomForest(
+  y ~ .,
+  data = train_first_rf,
+  ntree = 500,
+  mtry = floor(sqrt(ncol(train_first_rf) - 1)),
+  importance = TRUE,
+  classwt = c("0" = 2, "1" = 1)   # penalize FP more heavily
+)
+
+# Predicted probabilities (probability of cancellation)
+rf_prob <- predict(rf_model, test_first_rf, type = "prob")[,2]
+
+# Use 0.5 threshold for now (stacking will override later)
+rf_pred <- ifelse(rf_prob >= 0.5, 1, 0)
+
+rf_cm <- confusionMatrix(
+  as.factor(rf_pred),
+  as.factor(test_first_rf$y),
+  positive = "1"
+)
+
+rf_cm
+
+```
+
+```{r}
+rf_row <- data.frame(
+  model       = "Random Forest",
+  accuracy    = rf_cm$overall["Accuracy"],
+  kappa       = rf_cm$overall["Kappa"],
+  sensitivity = rf_cm$byClass["Sensitivity"],
+  specificity = rf_cm$byClass["Specificity"],
+  profit      = gain_function(rf_cm) / sum(rf_cm$table),
+  stringsAsFactors = FALSE
+)
+
+summary_table <- rbind(summary_table, rf_row)
+
+```
+
+
+```{r}
+### HEATMAP FOR MODEL COMPARISON
+
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+ggplot() +
+  geom_tile(
+    data  = df_metrics,
+    aes(x = metric, y = model, fill = value),
+    colour = "white"
+  ) +
+  geom_text(
+    data  = df_metrics,
+    aes(x = metric, y = model, label = round(value, 3)),
+    color = "black", size = 4
+  ) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+
+  ggnewscale::new_scale_fill() +
+
+  geom_tile(
+    data  = df_profit,
+    aes(x = metric, y = model, fill = value),
+    colour = "white"
+  ) +
+  geom_text(
+    data  = df_profit,
+    aes(x = metric, y = model, label = round(value, 3)),
+    color = "black", size = 4
+  ) +
   scale_fill_gradient(
     name = "Profit",
     low  = "#e5f5e0",
@@ -1472,28 +1618,153 @@ ggplot() +
   )
 
 ```
-###Random forrest
+**Tuned Random Forest (most important)**
+
 ```{r}
-# Random Forest (train + prob of class "1")
-rf_model <- randomForest(y ~ ., data = train_first_rf)
-p_rf <- predict(rf_model, newdata = test_first_rf, type = "prob")[, 2]
+set.seed(12345)
+
+rf_tuned <- randomForest(
+  y ~ .,
+  data   = train_first_rf,
+  ntree  = 800,
+  mtry   = floor(sqrt(ncol(train_first_rf) - 1)),
+  importance = TRUE
+)
+
+rf_probs <- predict(rf_tuned, newdata = test_first_rf, type = "prob")[, 2]
+
+thresholds <- seq(0, 1, by = 0.05)
+
+rf_results <- data.frame()
+
+for (t in thresholds) {
+  preds <- ifelse(rf_probs >= t, "1", "0")
+  cm <- confusionMatrix(as.factor(preds), test_first_rf$y, positive = "1")
+  
+  rf_results <- rbind(
+    rf_results,
+    data.frame(
+      threshold   = t,
+      accuracy    = cm$overall["Accuracy"],
+      kappa       = cm$overall["Kappa"],
+      sensitivity = cm$byClass["Sensitivity"],
+      specificity = cm$byClass["Specificity"],
+      profit      = gain_function(cm) / sum(cm$table),
+      stringsAsFactors = FALSE,
+      row.names       = NULL
+    )
+  )
+}
+
+# pick the best threshold by profit
+rf_best <- rf_results[which.max(rf_results$profit), ]
+
+rf_tuned_row <- data.frame(
+  model       = paste0("Random Forest tuned (t = ", rf_best$threshold, ")"),
+  accuracy    = rf_best$accuracy,
+  kappa       = rf_best$kappa,
+  sensitivity = rf_best$sensitivity,
+  specificity = rf_best$specificity,
+  profit      = rf_best$profit,
+  row.names   = NULL
+)
+
+summary_table <- rbind(summary_table, rf_tuned_row)
 
 ```
 
+
 ```{r}
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("accuracy", "kappa",
+                 "sensitivity", "specificity",
+                 "profit")
+    ),
+    model  = factor(model, levels = rev(unique(model)))
+  )
 
-# =========================
-# C5.0 Decision Tree (basic)
-# =========================
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
 
+ggplot() +
+  geom_tile(
+    data  = df_metrics,
+    aes(x = metric, y = model, fill = value),
+    colour = "white"
+  ) +
+  geom_text(
+    data  = df_metrics,
+    aes(x = metric, y = model, label = round(value, 3)),
+    color = "black",
+    size  = 4
+  ) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+  ggnewscale::new_scale_fill() +
+  geom_tile(
+    data  = df_profit,
+    aes(x = metric, y = model, fill = value),
+    colour = "white"
+  ) +
+  geom_text(
+    data  = df_profit,
+    aes(x = metric, y = model, label = round(value, 3)),
+    color = "black",
+    size  = 4
+  ) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+The Random Forest models perform well overall and clearly outperform the entire KNN group, but do not reach the very top performance of Logistic Regression or the strongest SVM models. The base Random Forest achieves an accuracy of 0.900 with a Kappa of 0.780, indicating strong agreement with true labels and good overall predictive skill. It also shows balanced behavior, with a sensitivity of 0.805 and a specificity of 0.956. In practical terms, this means the model correctly identifies many cancellations while still keeping the number of false positives relatively low. This matters for hotel decision making because false positives come with substantial financial penalties under the profit function.
+
+In terms of economic performance, the base Random Forest generates an average profit of 38.616 per booking. This is noticeably higher than the KNN models but still behind logistic regression at 50.455 and the top SVM models at roughly 49.7. The Random Forest clearly captures more complex interactions than distance based methods but still allows a few more costly errors than the best performing models.
+
+To further align the model with the business objective, we tuned the decision threshold to 0.55, pushing the model to be more conservative in predicting cancellations. This adjustment decreases sensitivity to 0.777 but increases specificity to 0.973. That shift means the tuned model catches fewer cancellations but dramatically reduces the number of false positives. Since false positives are far more expensive than missed cancellations, this trade off improves the model’s profitability. The tuned Random Forest generates a slightly higher profit of 39.514, showing that the threshold adjustment makes the model more aligned with financial priorities.
+
+Overall, both Random Forest models are strong and reliable performers. They consistently outperform KNN models and compete closely with SVMs, although they do not surpass logistic regression or the best SVM kernels in accuracy or profit. The tuned version in particular demonstrates how adjusting model behavior toward reducing false positives can yield meaningful financial benefits. In the context of the hotel cancellation problem, the Random Forest models provide solid predictive power and profit oriented performance but are not the top choice compared to the strongest alternatives
+
+
+### DT
+```{r}
+### Decision Tree with C5.0
+
+# helper to prepare data for C5.0
 prep_c50 <- function(df){
-  # Date -> numeric (days since 1970)
+  # convert Date columns to numeric if any exist
   date_cols <- sapply(df, inherits, what = "Date")
-  if (any(date_cols)) df[date_cols] <- lapply(df[date_cols], as.numeric)
+  if (any(date_cols)) {
+    df[date_cols] <- lapply(df[date_cols], as.numeric)
+  }
 
-  # character -> factor (just in case any slipped through)
+  # convert character to factor just in case
   char_cols <- sapply(df, is.character)
-  if (any(char_cols)) df[char_cols] <- lapply(df[char_cols], as.factor)
+  if (any(char_cols)) {
+    df[char_cols] <- lapply(df[char_cols], as.factor)
+  }
 
   df
 }
@@ -1501,42 +1772,112 @@ prep_c50 <- function(df){
 train_c50 <- prep_c50(train_first_dt)
 test_c50  <- prep_c50(test_first_dt)
 
-# ensure consistent 2-level factor outcome
+# ensure 2 level factor outcome with same levels in train and test
 train_c50$y <- droplevels(factor(train_c50$y))
 test_c50$y  <- factor(test_c50$y, levels = levels(train_c50$y))
 
 stopifnot(nlevels(train_c50$y) == 2)
 
-neg_lab <- levels(train_c50$y)[1]
-pos_lab <- levels(train_c50$y)[2]
+neg_lab <- levels(train_c50$y)[1]  # usually "No"
+pos_lab <- levels(train_c50$y)[2]  # usually "Yes"
 
 set.seed(12345)
 c50_model <- C50::C5.0(y ~ ., data = train_c50)
 
-# if the model produced no tree/rules, predict() will fail
-if (all(c50_model$size == 0)) {
-  stop("C5.0 produced tree size 0. Check class balance with table(train_first_dt$y) and predictors (some issue prevented splits).")
-}
-
-# Probabilities + class predictions (threshold 0.5)
+# predict probabilities for the positive class
 c50_prob <- predict(c50_model, newdata = test_c50, type = "prob")[, pos_lab]
-c50_pred <- factor(ifelse(c50_prob >= 0.5, pos_lab, neg_lab),
-                   levels = c(neg_lab, pos_lab))
 
-# Confusion matrix
+# classes with threshold 0.5 (you could later play with thresholds if you want)
+c50_pred <- factor(
+  ifelse(c50_prob >= 0.5, pos_lab, neg_lab),
+  levels = c(neg_lab, pos_lab)
+)
+
+# confusion matrix
 cm_c50 <- confusionMatrix(c50_pred, test_c50$y, positive = pos_lab)
 cm_c50
 
-# Profit
-c50_profit_total <- gain_function(cm_c50)
-c50_profit_per_booking <- c50_profit_total / nrow(test_c50)
-
-c50_profit_total
+# profit total and per booking
+c50_profit_total        <- gain_function(cm_c50)
+c50_profit_per_booking  <- c50_profit_total / nrow(test_c50)
 c50_profit_per_booking
 
 ```
 
-### 6. Here we combine the five prediction vectors and the response variable into a Data Frame. We are using probabilities.
+```{r}
+c50_row <- data.frame(
+  model       = "Decision Tree (C5.0)",
+  accuracy    = cm_c50$overall["Accuracy"],
+  kappa       = cm_c50$overall["Kappa"],
+  sensitivity = cm_c50$byClass["Sensitivity"],
+  specificity = cm_c50$byClass["Specificity"],
+  profit      = c50_profit_per_booking,
+  stringsAsFactors = FALSE
+)
+
+summary_table <- rbind(summary_table, c50_row)
+
+# then reuse your existing summary_long + heatmap code
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols      = -model,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    metric = factor(metric,
+                    levels = c("accuracy", "kappa",
+                               "sensitivity", "specificity",
+                               "profit")),
+    model  = factor(model, levels = rev(unique(model)))
+  )
+
+df_metrics <- dplyr::filter(summary_long, metric != "profit")
+df_profit  <- dplyr::filter(summary_long, metric == "profit")
+
+ggplot() +
+  geom_tile(data = df_metrics,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_metrics,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Performance",
+    low  = "#D8E6F3",
+    high = "#084594"
+  ) +
+  ggnewscale::new_scale_fill() +
+  geom_tile(data = df_profit,
+            aes(x = metric, y = model, fill = value),
+            colour = "white") +
+  geom_text(data = df_profit,
+            aes(x = metric, y = model, label = round(value, 3)),
+            color = "black", size = 4) +
+  scale_fill_gradient(
+    name = "Profit",
+    low  = "#e5f5e0",
+    high = "#238b45"
+  ) +
+  labs(
+    title = "Model Performance Comparison",
+    x     = "Metric",
+    y     = "Model"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+The C5.0 decision tree offers a simple and interpretable set of decision rules for understanding booking cancellations. Its accuracy is 0.897, with a Kappa score of 0.776, which indicates strong agreement with the true labels but still noticeably below the performance of logistic regression and the SVM models. Sensitivity is 0.824, meaning the tree correctly identifies most cancellations, but misses more cancellations than the top-performing models. Specificity is higher at 0.943, so it is more reliable at identifying non-cancellations than cancellations.
+
+In terms of business impact, the model generates an average profit of 37.20 per booking. This is significantly below logistic regression and the SVM models but slightly higher than the KNN variants. While the tree is not the most profitable model, its value lies in interpretability: it clearly highlights features like lead_time, deposit_type, and market_segment as primary drivers of cancellations, which can help the hotel directly understand and act on the underlying behavioral patterns.
+
+Overall, the C5.0 tree is a solid explanatory tool and a reasonable standalone model, but it is not competitive with the top-performing algorithms for maximizing profit or minimizing costly false positives. Its greatest strength is interpretability rather than predictive power.
+
+
+### Here we combine the five prediction vectors and the response variable into a Data Frame. We are using probabilities.
 ```{r}
 # =========================
 # Step 6: Stack (probabilities) — NO ANN
@@ -1580,6 +1921,7 @@ str(stack_df)
 head(stack_df)
 
 ```
+
 ###We will break the data frame into a 70/30 train/test split
 ```{r}
 
@@ -1598,6 +1940,7 @@ table(stack_train$y)
 table(stack_test$y)
 
 ```
+
 ###Build the stacked model
 ```{r}
 
@@ -1615,6 +1958,7 @@ plot(meta_tree)
 summary(meta_tree)
 
 ```
+
 ###Predict stacked model
 ```{r}
 
@@ -1627,6 +1971,7 @@ cm_meta <- confusionMatrix(meta_pred, stack_test$y, positive = "1")
 cm_meta
 
 ```
+
 ###Build and predict stacked model with cost matrix added
 ```{r}
 
@@ -1688,7 +2033,9 @@ meta_profit_total
 meta_profit_per_booking
 
 ```
-###Step 10: Compare all models on precision, accuracy, kappa, sensitivity, and normalized profit
+
+
+### Compare all models on precision, accuracy, kappa, sensitivity, and normalized profit
 ```{r}
 
 # Step 10: Compare models on THEIR OWN test sets
